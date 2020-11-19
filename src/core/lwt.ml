@@ -397,11 +397,19 @@ struct
   [@@@ocaml.warning "+37"]
 
 
+  (* Counters below 50 are reserved for lwt management *)
+  let fresh =
+    let counter = ref 50 in
+    fun () ->
+      incr counter;
+      !counter
+
 
   (* Promises proper. *)
 
   type ('a, 'u, 'c) promise = {
     mutable state : ('a, 'u, 'c) state;
+    uid: int;
   }
 
   and (_, _, _) state =
@@ -1504,29 +1512,31 @@ sig
   val fail_invalid_arg : string -> _ t
 end =
 struct
-  let return v =
-    to_public_promise {state = Fulfilled v}
+  let return ?(uid = fresh ()) v =
+    to_public_promise {state = Fulfilled v; uid}
 
   let of_result result =
-    to_public_promise {state = state_of_result result}
+    to_public_promise {state = state_of_result result; uid = fresh ()}
 
   let fail exn =
-    to_public_promise {state = Rejected exn}
+    to_public_promise {state = Rejected exn; uid = fresh ()}
 
-  let return_unit = return ()
-  let return_none = return None
+  let return_unit = return ~uid:0 ()
+  let return_none = return ~uid:1 None
   let return_some x = return (Some x)
-  let return_nil = return []
-  let return_true = return true
-  let return_false = return false
+  let return_nil = return ~uid:2 []
+  let return_true = return ~uid:3 true
+  let return_false = return ~uid:4 false
   let return_ok x = return (Result.Ok x)
   let return_error x = return (Result.Error x)
 
   let fail_with msg =
-    to_public_promise {state = Rejected (Failure msg)}
+    to_public_promise {state = Rejected (Failure msg); uid = fresh ()}
 
   let fail_invalid_arg msg =
-    to_public_promise {state = Rejected (Invalid_argument msg)}
+    to_public_promise {state = Rejected (Invalid_argument msg); uid = fresh ()}
+
+  let return v = return v
 end
 include Trivial_promises
 
@@ -1561,7 +1571,7 @@ struct
         cleanups_deferred = 0;
       }
     in
-    {state}
+    {state; uid = fresh ()}
 
   let propagate_cancel_to_several ps =
     (* Using a dirty cast here to avoid rebuilding the list :( Not bothering
@@ -1906,7 +1916,7 @@ struct
           (p'', callback, p.state))
 
     | Rejected _ as result ->
-      to_public_promise {state = result}
+      to_public_promise {state = result; uid = fresh ()}
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
@@ -1960,7 +1970,7 @@ struct
           (p'', callback, p.state))
 
     | Rejected exn ->
-      to_public_promise {state = Rejected (add_loc exn)}
+      to_public_promise {state = Rejected (add_loc exn); uid = fresh ()}
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
@@ -2008,14 +2018,14 @@ struct
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
           to_public_promise
-            {state = try Fulfilled (f v) with exn -> Rejected exn})
+            {state = (try Fulfilled (f v) with exn -> Rejected exn); uid = fresh ()})
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
           (p'', callback, p.state))
 
     | Rejected _ as result ->
-      to_public_promise {state = result}
+      to_public_promise {state = result; uid = fresh ()}
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
@@ -2555,7 +2565,7 @@ struct
       match ps with
       | [] ->
         if !number_pending_in_ps = 0 then
-          to_public_promise {state = !join_result}
+          to_public_promise {state = !join_result; uid = fresh ()}
         else
           to_public_promise p'
 
@@ -2784,7 +2794,7 @@ struct
           collect_already_fulfilled_promises_or_find_rejected (v::acc) ps
 
         | Rejected _ as result ->
-          to_public_promise {state = result}
+          to_public_promise {state = result; uid = fresh ()}
 
         | Pending _ ->
           collect_already_fulfilled_promises_or_find_rejected acc ps
@@ -2817,7 +2827,7 @@ struct
           collect_already_fulfilled_promises_or_find_rejected [v] ps
 
         | Rejected _ as result ->
-          to_public_promise {state = result}
+          to_public_promise {state = result ; uid = fresh ()}
 
         | Pending _ ->
           check_for_already_resolved_promises ps
@@ -2845,7 +2855,7 @@ struct
 
         | Rejected _ as result ->
           List.iter cancel ps;
-          to_public_promise {state = result}
+          to_public_promise {state = result ; uid = fresh ()}
 
         | Pending _ ->
           collect_already_fulfilled_promises_or_find_rejected acc ps'
@@ -2877,7 +2887,7 @@ struct
 
         | Rejected _ as result ->
           List.iter cancel ps;
-          to_public_promise {state = result}
+          to_public_promise {state = result; uid = fresh ()}
 
         | Pending _ ->
           check_for_already_resolved_promises ps'
@@ -2932,7 +2942,7 @@ struct
           collect_already_resolved_promises (v::results) pending ps
 
         | Rejected _ as result ->
-          to_public_promise {state = result}
+          to_public_promise {state = result ; uid = fresh ()}
 
         | Pending _ ->
           collect_already_resolved_promises results (p::pending) ps
@@ -2960,7 +2970,7 @@ struct
           collect_already_resolved_promises [v] pending_acc ps'
 
         | Rejected _ as result ->
-          to_public_promise {state = result}
+          to_public_promise {state = result ; uid = fresh ()}
 
         | Pending _ ->
           check_for_already_resolved_promises (p::pending_acc) ps'
