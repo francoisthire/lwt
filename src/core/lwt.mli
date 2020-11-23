@@ -1983,3 +1983,7 @@ val backtrace_try_bind :
 val abandon_wakeups : unit -> unit
 
 val debug_state_is : 'a state -> 'a t -> bool t
+
+(* Light-weight profiling *)
+
+val uid_of_promise : 'a t -> Lwt_tracing.promise_uid

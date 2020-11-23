@@ -409,7 +409,7 @@ struct
 
   type ('a, 'u, 'c) promise = {
     mutable state : ('a, 'u, 'c) state;
-    uid: int;
+    uid: int; (* Profiling *)
   }
 
   and (_, _, _) state =
@@ -601,6 +601,12 @@ struct
   let state_of_result = function
     | Result.Ok x -> Fulfilled x
     | Result.Error exn -> Rejected exn
+
+  (* Profiling *)
+  let uid_of_promise t =
+    let Internal {uid; _} = to_internal_promise t in
+    uid
+
 end
 include Public_types
 
@@ -1513,13 +1519,30 @@ sig
 end =
 struct
   let return ?(uid = fresh ()) v =
-    to_public_promise {state = Fulfilled v; uid}
+    let p = to_public_promise {state = Fulfilled v; uid} in
+    Lwt_tracing.(!tracer.create_promise uid `Return );
+    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+    p
 
   let of_result result =
-    to_public_promise {state = state_of_result result; uid = fresh ()}
+    let uid = fresh () in
+    let p = to_public_promise {state = state_of_result result; uid} in
+    begin
+      match result with
+      | Ok _ ->
+        Lwt_tracing.(!tracer.create_promise uid `Return );
+      | Error _ ->
+        Lwt_tracing.(!tracer.create_promise uid `Fail );
+    end;
+    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+    p
 
   let fail exn =
-    to_public_promise {state = Rejected exn; uid = fresh ()}
+    let uid = fresh () in
+    let p = to_public_promise {state = Rejected exn; uid} in
+    Lwt_tracing.(!tracer.create_promise uid `Fail );
+    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+    p
 
   let return_unit = return ~uid:0 ()
   let return_none = return ~uid:1 None
@@ -1531,10 +1554,18 @@ struct
   let return_error x = return (Result.Error x)
 
   let fail_with msg =
-    to_public_promise {state = Rejected (Failure msg); uid = fresh ()}
+    let uid = fresh () in
+    let p = to_public_promise {state = Rejected (Failure msg); uid} in
+    Lwt_tracing.(!tracer.create_promise uid `Fail );
+    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+    p
 
   let fail_invalid_arg msg =
-    to_public_promise {state = Rejected (Invalid_argument msg); uid = fresh ()}
+    let uid = fresh () in
+    let p = to_public_promise {state = Rejected (Invalid_argument msg); uid} in
+    Lwt_tracing.(!tracer.create_promise uid `Fail );
+    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+    p
 
   let return v = return v
 end
@@ -1545,7 +1576,7 @@ include Trivial_promises
 module Pending_promises :
 sig
   (* Internal *)
-  val new_pending :
+  val new_pending : promise_type:Lwt_tracing.promise_type ->
     how_to_cancel:how_to_cancel -> ('a, underlying, pending) promise
   val propagate_cancel_to_several : _ t list -> how_to_cancel
 
@@ -1555,14 +1586,14 @@ sig
 
   val waiter_of_wakener : 'a u -> 'a t
 
-  val add_task_r : 'a u Lwt_sequence.t -> 'a t
-  val add_task_l : 'a u Lwt_sequence.t -> 'a t
+  val add_task_r : ?promise_type:Lwt_tracing.promise_type -> 'a u Lwt_sequence.t -> 'a t
+  val add_task_l : ?promise_type:Lwt_tracing.promise_type -> 'a u Lwt_sequence.t -> 'a t
 
   val protected : 'a t -> 'a t
   val no_cancel : 'a t -> 'a t
 end =
 struct
-  let new_pending ~how_to_cancel =
+  let new_pending ~promise_type ~how_to_cancel =
     let state =
       Pending {
         regular_callbacks = Regular_callback_list_empty;
@@ -1571,7 +1602,12 @@ struct
         cleanups_deferred = 0;
       }
     in
-    {state; uid = fresh ()}
+    let uid = fresh () in
+    let p = {state; uid} in
+    Lwt_tracing.(!tracer.create_promise uid promise_type);
+    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+    p
+
 
   let propagate_cancel_to_several ps =
     (* Using a dirty cast here to avoid rebuilding the list :( Not bothering
@@ -1584,11 +1620,11 @@ struct
 
 
   let wait () =
-    let p = new_pending ~how_to_cancel:Not_cancelable in
+    let p = new_pending ~promise_type:`Wait ~how_to_cancel:Not_cancelable in
     to_public_promise p, to_public_resolver p
 
   let task () =
-    let p = new_pending ~how_to_cancel:Cancel_this_promise in
+    let p = new_pending ~promise_type:`Task ~how_to_cancel:Cancel_this_promise in
     to_public_promise p, to_public_resolver p
 
 
@@ -1606,8 +1642,8 @@ struct
         : ('a, 'u, 'c) promise Lwt_sequence.node =
     Obj.magic node
 
-  let add_task_r sequence =
-    let p = new_pending ~how_to_cancel:Cancel_this_promise in
+  let add_task_r ?(promise_type=`Sequence) sequence =
+    let p = new_pending ~promise_type ~how_to_cancel:Cancel_this_promise in
     let node = Lwt_sequence.add_r (to_public_resolver p) sequence in
     let node = cast_sequence_node node p in
 
@@ -1617,8 +1653,8 @@ struct
 
     to_public_promise p
 
-  let add_task_l sequence =
-    let p = new_pending ~how_to_cancel:Cancel_this_promise in
+  let add_task_l ?(promise_type=`Sequence) sequence =
+    let p = new_pending ~promise_type ~how_to_cancel:Cancel_this_promise in
     let node = Lwt_sequence.add_l (to_public_resolver p) sequence in
     let node = cast_sequence_node node p in
 
@@ -1637,7 +1673,7 @@ struct
     | Rejected _ -> p
 
     | Pending _ ->
-      let p' = new_pending ~how_to_cancel:Cancel_this_promise in
+      let p' = new_pending ~promise_type:`Protected ~how_to_cancel:Cancel_this_promise in
 
       let callback p_result =
         let State_may_now_be_pending_proxy p' = may_now_be_proxy p' in
@@ -1678,7 +1714,7 @@ struct
     | Rejected _ -> p
 
     | Pending p_callbacks ->
-      let p' = new_pending ~how_to_cancel:Not_cancelable in
+      let p' = new_pending ~promise_type:`No_cancel ~how_to_cancel:Not_cancelable in
 
       let callback p_result =
         let State_may_now_be_pending_proxy p' = may_now_be_proxy p' in
@@ -1856,7 +1892,7 @@ struct
 
       Functions other than [Lwt.bind] have analogous deferral behavior. *)
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Bind ~how_to_cancel:(Propagate_cancel_to_one p) in
       (* The result promise is a fresh pending promise.
 
          Initially, trying to cancel this fresh pending promise [p''] will
@@ -1916,7 +1952,11 @@ struct
           (p'', callback, p.state))
 
     | Rejected _ as result ->
-      to_public_promise {state = result; uid = fresh ()}
+      let uid = fresh () in
+      let p = to_public_promise {state = result; uid} in
+      Lwt_tracing.(!tracer.create_promise uid `Fail);
+      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+      p
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
@@ -1928,7 +1968,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Backtrace_bind ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -1970,7 +2010,11 @@ struct
           (p'', callback, p.state))
 
     | Rejected exn ->
-      to_public_promise {state = Rejected (add_loc exn); uid = fresh ()}
+      let uid = fresh () in
+      let p = to_public_promise {state = Rejected (add_loc exn); uid} in
+      Lwt_tracing.(!tracer.create_promise uid `Fail);
+      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+      p
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
@@ -1982,7 +2026,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Map ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2017,15 +2061,23 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-          to_public_promise
-            {state = (try Fulfilled (f v) with exn -> Rejected exn); uid = fresh ()})
+          let uid = fresh () in
+          let p = to_public_promise
+            {state = (try Fulfilled (f v) with exn -> Rejected exn); uid} in
+          Lwt_tracing.(!tracer.create_promise uid `Fail);
+          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+          p)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
           (p'', callback, p.state))
 
     | Rejected _ as result ->
-      to_public_promise {state = result; uid = fresh ()}
+      let uid = fresh () in
+      let p = to_public_promise {state = result; uid} in
+      Lwt_tracing.(!tracer.create_promise uid `Fail);
+      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+      p
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
@@ -2038,7 +2090,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Catch ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2093,7 +2145,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Backtrace_catch ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2148,7 +2200,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Try_bind ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2214,7 +2266,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Backtrace_try_bind ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2527,7 +2579,7 @@ struct
 
 
   let join ps =
-    let p' = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+    let p' = new_pending ~promise_type:`Join ~how_to_cancel:(propagate_cancel_to_several ps) in
 
     let number_pending_in_ps = ref 0 in
     let join_result = ref (Fulfilled ()) in
@@ -2564,8 +2616,17 @@ struct
     let rec attach_callback_or_resolve_immediately ps =
       match ps with
       | [] ->
-        if !number_pending_in_ps = 0 then
-          to_public_promise {state = !join_result; uid = fresh ()}
+        if !number_pending_in_ps = 0 then (
+          let uid = fresh () in
+          let p = to_public_promise {state = !join_result; uid = fresh ()} in
+          begin
+            match !join_result with
+            | Fulfilled () ->  Lwt_tracing.(!tracer.create_promise uid `Return)
+            | Rejected _ -> Lwt_tracing.(!tracer.create_promise uid `Fail)
+          end;
+          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+          p
+        )
         else
           to_public_promise p'
 
@@ -2701,7 +2762,7 @@ struct
         "Lwt.choose [] would return a promise that is pending forever";
     match count_resolved_promises_in ps with
     | 0 ->
-      let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+      let p = new_pending ~promise_type:`Choose ~how_to_cancel:(propagate_cancel_to_several ps) in
 
       let callback result =
         let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2725,7 +2786,7 @@ struct
       invalid_arg "Lwt.pick [] would return a promise that is pending forever";
     match count_resolved_promises_in ps with
     | 0 ->
-      let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+      let p = new_pending ~promise_type:`Pick ~how_to_cancel:(propagate_cancel_to_several ps) in
 
       let callback result =
         let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2794,7 +2855,11 @@ struct
           collect_already_fulfilled_promises_or_find_rejected (v::acc) ps
 
         | Rejected _ as result ->
-          to_public_promise {state = result; uid = fresh ()}
+          let uid = fresh () in
+          let p = to_public_promise {state = result; uid} in
+          Lwt_tracing.(!tracer.create_promise uid `Fail);
+          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+          p
 
         | Pending _ ->
           collect_already_fulfilled_promises_or_find_rejected acc ps
@@ -2806,7 +2871,7 @@ struct
     let rec check_for_already_resolved_promises ps' =
       match ps' with
       | [] ->
-        let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+        let p = new_pending ~promise_type:`Nchoose ~how_to_cancel:(propagate_cancel_to_several ps) in
 
         let callback _result =
           let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2827,7 +2892,11 @@ struct
           collect_already_fulfilled_promises_or_find_rejected [v] ps
 
         | Rejected _ as result ->
-          to_public_promise {state = result ; uid = fresh ()}
+          let uid = fresh () in
+          let p = to_public_promise {state = result; uid} in
+          Lwt_tracing.(!tracer.create_promise uid `Fail);
+          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+          p
 
         | Pending _ ->
           check_for_already_resolved_promises ps
@@ -2855,7 +2924,11 @@ struct
 
         | Rejected _ as result ->
           List.iter cancel ps;
-          to_public_promise {state = result ; uid = fresh ()}
+          let uid = fresh () in
+          let p = to_public_promise {state = result; uid} in
+          Lwt_tracing.(!tracer.create_promise uid `Fail);
+          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+          p
 
         | Pending _ ->
           collect_already_fulfilled_promises_or_find_rejected acc ps'
@@ -2864,7 +2937,7 @@ struct
     let rec check_for_already_resolved_promises ps' =
       match ps' with
       | [] ->
-        let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+        let p = new_pending ~promise_type:`Npick ~how_to_cancel:(propagate_cancel_to_several ps) in
 
         let callback _result =
           let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2887,7 +2960,11 @@ struct
 
         | Rejected _ as result ->
           List.iter cancel ps;
-          to_public_promise {state = result; uid = fresh ()}
+          let uid = fresh () in
+          let p = to_public_promise {state = result; uid} in
+          Lwt_tracing.(!tracer.create_promise uid `Fail);
+          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+          p
 
         | Pending _ ->
           check_for_already_resolved_promises ps'
@@ -2951,7 +3028,7 @@ struct
     let rec check_for_already_resolved_promises pending_acc ps' =
       match ps' with
       | [] ->
-        let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+        let p = new_pending ~promise_type:`Nchoose_split ~how_to_cancel:(propagate_cancel_to_several ps) in
 
         let callback _result =
           let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2970,7 +3047,11 @@ struct
           collect_already_resolved_promises [v] pending_acc ps'
 
         | Rejected _ as result ->
-          to_public_promise {state = result ; uid = fresh ()}
+          let uid = fresh () in
+          let p = to_public_promise {state = result; uid} in
+          Lwt_tracing.(!tracer.create_promise uid `Fail);
+          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+          p
 
         | Pending _ ->
           check_for_already_resolved_promises (p::pending_acc) ps'
@@ -3176,3 +3257,10 @@ struct
   let make_error exn = Result.Error exn
 end
 include Lwt_result_type
+
+
+(* Because of profiling using optional parameter *)
+
+let add_task_r node = add_task_r node
+
+let add_task_l node = add_task_l node
