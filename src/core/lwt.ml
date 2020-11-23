@@ -550,7 +550,8 @@ struct
 end
 open Main_internal_types
 
-
+(* profiling *)
+let uid_of_internal_promise {uid; _} = uid
 
 module Public_types =
 struct
@@ -1831,7 +1832,8 @@ struct
     (* Using [p'] as it's the name used inside [bind], etc., for promises with
        this role -- [p'] is the promise returned by the user's function. *)
     let p' = underlying user_provided_promise in
-
+    Lwt_tracing.(!tracer.proxy (uid_of_internal_promise user_provided_promise)
+                   (uid_of_internal_promise outer_promise));
     if identical p' outer_promise then
       State_may_have_changed p'
       (* We really want to return [State_may_have_changed outer_promise], but
