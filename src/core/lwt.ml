@@ -397,13 +397,6 @@ struct
   [@@@ocaml.warning "+37"]
 
 
-  (* Counters below 50 are reserved for lwt management *)
-  let fresh =
-    let counter = ref 50 in
-    fun () ->
-      incr counter;
-      !counter
-
   let callback_fresh =
     let counter = ref 0 in
     fun () ->
@@ -415,7 +408,7 @@ struct
 
   type ('a, 'u, 'c) promise = {
     mutable state : ('a, 'u, 'c) state;
-    uid: int; (* Profiling *)
+    uid: Lwt_tracing.promise_uid; (* Profiling *)
   }
 
   and (_, _, _) state =
@@ -553,11 +546,13 @@ struct
 
      - The [cleanups_deferred] field is explained in module
        [Pending_callbacks]. *)
+
+
+  (* profiling *)
+  let uid_of_internal_promise {uid; _} = uid
+
 end
 open Main_internal_types
-
-(* profiling *)
-let uid_of_internal_promise {uid; _} = uid
 
 module Public_types =
 struct
@@ -1414,6 +1409,7 @@ struct
       Printf.ksprintf invalid_arg "Lwt.%s" api_function_name
 
     | Pending _ ->
+      Lwt_tracing.(!tracer.wakeup (uid_of_internal_promise p) (Wakeup_type result));
       let result = state_of_result result in
       let State_may_have_changed p = resolve ~allow_deferring:false p result in
       ignore p
@@ -1435,6 +1431,7 @@ struct
       Printf.ksprintf invalid_arg "Lwt.%s" api_function_name
 
     | Pending _ ->
+      Lwt_tracing.(!tracer.wakeup (uid_of_internal_promise p) (Wakeup_type result));
       let result = state_of_result result in
       let State_may_have_changed p =
         resolve ~maximum_callback_nesting_depth:1 p result in
@@ -1490,6 +1487,7 @@ struct
           | Not_cancelable ->
             callbacks_accumulator
           | Cancel_this_promise ->
+            Lwt_tracing.(!tracer.cancel (uid_of_internal_promise p));
             let State_may_have_changed p =
               set_promise_state p canceled_result in
             ignore p;
@@ -1532,14 +1530,14 @@ sig
   val fail_invalid_arg : string -> _ t
 end =
 struct
-  let return ?(uid = fresh ()) v =
+  let return ?(uid = Lwt_tracing.fresh ()) v =
     let p = to_public_promise {state = Fulfilled v; uid} in
     Lwt_tracing.(!tracer.create_promise uid `Return );
     Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
     p
 
   let of_result result =
-    let uid = fresh () in
+    let uid = Lwt_tracing.fresh () in
     let p = to_public_promise {state = state_of_result result; uid} in
     begin
       match result with
@@ -1552,30 +1550,30 @@ struct
     p
 
   let fail exn =
-    let uid = fresh () in
+    let uid = Lwt_tracing.fresh () in
     let p = to_public_promise {state = Rejected exn; uid} in
     Lwt_tracing.(!tracer.create_promise uid `Fail );
     Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
     p
 
-  let return_unit = return ~uid:0 ()
-  let return_none = return ~uid:1 None
+  let return_unit = return ~uid:(Lwt_tracing.uid_of_static_promise `Return_unit) ()
+  let return_none = return ~uid:(Lwt_tracing.uid_of_static_promise `Return_none) None
   let return_some x = return (Some x)
-  let return_nil = return ~uid:2 []
-  let return_true = return ~uid:3 true
-  let return_false = return ~uid:4 false
+  let return_nil = return ~uid:(Lwt_tracing.uid_of_static_promise `Return_nil) []
+  let return_true = return ~uid:(Lwt_tracing.uid_of_static_promise `Return_true) true
+  let return_false = return ~uid:(Lwt_tracing.uid_of_static_promise `Return_false) false
   let return_ok x = return (Result.Ok x)
   let return_error x = return (Result.Error x)
 
   let fail_with msg =
-    let uid = fresh () in
+    let uid = Lwt_tracing.fresh () in
     let p = to_public_promise {state = Rejected (Failure msg); uid} in
     Lwt_tracing.(!tracer.create_promise uid `Fail );
     Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
     p
 
   let fail_invalid_arg msg =
-    let uid = fresh () in
+    let uid = Lwt_tracing.fresh () in
     let p = to_public_promise {state = Rejected (Invalid_argument msg); uid} in
     Lwt_tracing.(!tracer.create_promise uid `Fail );
     Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
@@ -1616,7 +1614,7 @@ struct
         cleanups_deferred = 0;
       }
     in
-    let uid = fresh () in
+    let uid = Lwt_tracing.fresh () in
     let p = {state; uid} in
     Lwt_tracing.(!tracer.create_promise uid promise_type);
     Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
@@ -1996,7 +1994,7 @@ struct
           (p'', (cuid,callback), p.state))
 
     | Rejected _ as result ->
-      let uid = fresh () in
+      let uid = Lwt_tracing.fresh () in
       let p = to_public_promise {state = result; uid} in
       Lwt_tracing.(!tracer.create_promise uid `Fail);
       Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
@@ -2067,7 +2065,7 @@ struct
           (p'', (cuid,callback), p.state))
 
     | Rejected exn ->
-      let uid = fresh () in
+      let uid = Lwt_tracing.fresh () in
       let p = to_public_promise {state = Rejected (add_loc exn); uid} in
       Lwt_tracing.(!tracer.create_promise uid `Fail);
       Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
@@ -2126,7 +2124,7 @@ struct
           let cty = Lwt_tracing.Map (`Eager, f) in
           Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
           Lwt_tracing.(!tracer.resolve cuid);
-          let uid = fresh () in
+          let uid = Lwt_tracing.fresh () in
           let p = to_public_promise
             {state = (try Fulfilled (f v) with exn -> Rejected exn); uid} in
           Lwt_tracing.(!tracer.create_promise uid `Fail);
@@ -2142,7 +2140,7 @@ struct
           (p'', (cuid,callback), p.state))
 
     | Rejected _ as result ->
-      let uid = fresh () in
+      let uid = Lwt_tracing.fresh () in
       let p = to_public_promise {state = result; uid} in
       Lwt_tracing.(!tracer.create_promise uid `Fail);
       Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
@@ -2850,8 +2848,8 @@ struct
       match ps with
       | [] ->
         if !number_pending_in_ps = 0 then (
-          let uid = fresh () in
-          let p = to_public_promise {state = !join_result; uid = fresh ()} in
+          let uid = Lwt_tracing.fresh () in
+          let p = to_public_promise {state = !join_result; uid} in
           begin
             match !join_result with
             | Fulfilled () ->  Lwt_tracing.(!tracer.create_promise uid `Return)
@@ -3101,7 +3099,7 @@ struct
           collect_already_fulfilled_promises_or_find_rejected (v::acc) ps
 
         | Rejected _ as result ->
-          let uid = fresh () in
+          let uid = Lwt_tracing.fresh () in
           let p = to_public_promise {state = result; uid} in
           Lwt_tracing.(!tracer.create_promise uid `Fail);
           Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
@@ -3143,7 +3141,7 @@ struct
           collect_already_fulfilled_promises_or_find_rejected [v] ps
 
         | Rejected _ as result ->
-          let uid = fresh () in
+          let uid = Lwt_tracing.fresh () in
           let p = to_public_promise {state = result; uid} in
           Lwt_tracing.(!tracer.create_promise uid `Fail);
           Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
@@ -3175,7 +3173,7 @@ struct
 
         | Rejected _ as result ->
           List.iter cancel ps;
-          let uid = fresh () in
+          let uid = Lwt_tracing.fresh () in
           let p = to_public_promise {state = result; uid} in
           Lwt_tracing.(!tracer.create_promise uid `Fail);
           Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
@@ -3216,7 +3214,7 @@ struct
 
         | Rejected _ as result ->
           List.iter cancel ps;
-          let uid = fresh () in
+          let uid = Lwt_tracing.fresh () in
           let p = to_public_promise {state = result; uid} in
           Lwt_tracing.(!tracer.create_promise uid `Fail);
           Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
@@ -3275,7 +3273,8 @@ struct
           collect_already_resolved_promises (v::results) pending ps
 
         | Rejected _ as result ->
-          to_public_promise {state = result ; uid = fresh ()}
+          let uid = Lwt_tracing.fresh () in
+          to_public_promise {state = result ; uid}
 
         | Pending _ ->
           collect_already_resolved_promises results (p::pending) ps
@@ -3308,7 +3307,7 @@ struct
           collect_already_resolved_promises [v] pending_acc ps'
 
         | Rejected _ as result ->
-          let uid = fresh () in
+          let uid = Lwt_tracing.fresh () in
           let p = to_public_promise {state = result; uid} in
           Lwt_tracing.(!tracer.create_promise uid `Fail);
           Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;

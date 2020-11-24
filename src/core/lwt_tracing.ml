@@ -1,5 +1,28 @@
 type promise_uid = int
 
+(* Counters below 50 are reserved for lwt management *)
+let fresh =
+  let counter = ref 50 in
+  fun () ->
+    incr counter;
+    !counter
+
+type static_promise =
+  [
+    | `Return_unit
+    | `Return_none
+    | `Return_nil
+    | `Return_true
+    | `Return_false
+  ]
+
+let uid_of_static_promise = function
+  | `Return_unit  -> 0
+  | `Return_none  -> 1
+  | `Return_nil   -> 2
+  | `Return_true  -> 3
+  | `Return_false -> 4
+
 type attached_strategy = [`Eager | `Deferred | `Pending]
 
 type state =
@@ -66,6 +89,9 @@ let is_already_resolved = function
   | `Fail -> true
   | _ -> false
 
+type wakeup_type =
+  | Wakeup_type : ('a, exn) result -> wakeup_type
+
 
 type tracer =
   {
@@ -73,7 +99,7 @@ type tracer =
 
     attach_callback : promise_uid -> callback_uid -> callback_type -> unit;
 
-    wakeup : promise_uid -> exn option -> unit;
+    wakeup : promise_uid -> wakeup_type -> unit;
 
     cancel : promise_uid -> unit;
 
