@@ -397,13 +397,6 @@ struct
   [@@@ocaml.warning "+37"]
 
 
-  let callback_fresh =
-    let counter = ref 0 in
-    fun () ->
-      incr counter;
-      !counter
-
-
   (* Promises proper. *)
 
   type ('a, 'u, 'c) promise = {
@@ -455,9 +448,9 @@ struct
     mutable cleanups_deferred : int;
   }
 
-  and 'a regular_callback = int * ('a resolved_state -> unit)
+  and 'a regular_callback = Lwt_tracing.callback_uid * ('a resolved_state -> unit)
 
-  and cancel_callback = int * (unit -> unit)
+  and cancel_callback = Lwt_tracing.callback_uid * (unit -> unit)
 
   and 'a resolved_state = ('a, underlying, resolved) state
 
@@ -486,7 +479,7 @@ struct
       storage * cancel_callback ->
         _ cancel_callback_list
     | Cancel_callback_list_remove_sequence_node :
-      int * ('a, _, _) promise Lwt_sequence.node ->
+      Lwt_tracing.callback_uid * ('a, _, _) promise Lwt_sequence.node ->
         'a cancel_callback_list
 
   (* Notes:
@@ -851,7 +844,7 @@ sig
     'a t list -> 'a regular_callback -> unit
   val add_explicitly_removable_callback_and_give_remove_function :
     'a t list -> 'a regular_callback -> (unit -> unit)
-  val add_cancel_callback : 'a callbacks -> int * (unit -> unit) -> unit
+  val add_cancel_callback : 'a callbacks -> Lwt_tracing.callback_uid * (unit -> unit) -> unit
   val merge_callbacks : from:'a callbacks -> into:'a callbacks -> unit
 end =
 struct
@@ -926,7 +919,7 @@ struct
            must have been the cell cleared in this function, above. In that
            case, just set its callback list to empty. *)
         | Regular_callback_list_explicitly_removable_callback {contents = Some (cuid,_)} ->
-          Lwt_tracing.(!tracer.detach_callback (uid_of_internal_promise p) cuid);
+          Lwt_tracing.(detach_callback (uid_of_internal_promise p) cuid);
           callbacks.regular_callbacks <- Regular_callback_list_empty
         | Regular_callback_list_explicitly_removable_callback {contents = None} ->
           callbacks.regular_callbacks <- Regular_callback_list_empty
@@ -1027,7 +1020,7 @@ struct
 
   let add_cancel_callback callbacks f =
     (* Ugly cast :( *)
-    let cast_cancel_callback : int * (unit -> unit) -> cancel_callback = Obj.magic in
+    let cast_cancel_callback : Lwt_tracing.callback_uid * (unit -> unit) -> cancel_callback = Obj.magic in
     let f = cast_cancel_callback f in
 
     let node = Cancel_callback_list_callback (!current_storage, f) in
@@ -1174,7 +1167,7 @@ struct
       exit 2)
 
   let handle_with_async_exception_hook (id,f) v =
-    Lwt_tracing.(!tracer.resolve id);
+    let f = Lwt_tracing.resolve id f in
     (* Note that this function does not care if [f] evaluates to a promise. In
        particular, if [f v] evaluates to [p] and [p] is already rejected or will
        be reject later, it is not the responsibility of this function to pass
@@ -1210,8 +1203,8 @@ struct
           handle_with_async_exception_hook f ();
           iter_list rest
         | Cancel_callback_list_remove_sequence_node (id, node) ->
-          Lwt_tracing.(!tracer.resolve id);
-          Lwt_sequence.remove node;
+          let f = Lwt_tracing.resolve id (fun () -> Lwt_sequence.remove node) in
+          f ();
           iter_list rest
         | Cancel_callback_list_concat (fs, fs') ->
           iter_callback_list fs (fs'::rest)
@@ -1232,7 +1225,7 @@ struct
         | Regular_callback_list_empty ->
           iter_list rest
         | Regular_callback_list_implicitly_removed_callback (id,f) ->
-          Lwt_tracing.(!tracer.resolve id);
+          let f = Lwt_tracing.resolve id f in
           f result;
           iter_list rest
         | Regular_callback_list_explicitly_removable_callback
@@ -1240,7 +1233,7 @@ struct
           iter_list rest
         | Regular_callback_list_explicitly_removable_callback
             {contents = Some (id,f)} ->
-          Lwt_tracing.(!tracer.resolve id);
+          let f = Lwt_tracing.resolve id f in
           f result;
           iter_list rest
         | Regular_callback_list_concat (fs, fs') ->
@@ -1409,7 +1402,7 @@ struct
       Printf.ksprintf invalid_arg "Lwt.%s" api_function_name
 
     | Pending _ ->
-      Lwt_tracing.(!tracer.wakeup (uid_of_internal_promise p) (Wakeup_type result));
+      Lwt_tracing.wakeup (uid_of_internal_promise p) (Lwt_tracing.Wakeup_type result);
       let result = state_of_result result in
       let State_may_have_changed p = resolve ~allow_deferring:false p result in
       ignore p
@@ -1431,7 +1424,7 @@ struct
       Printf.ksprintf invalid_arg "Lwt.%s" api_function_name
 
     | Pending _ ->
-      Lwt_tracing.(!tracer.wakeup (uid_of_internal_promise p) (Wakeup_type result));
+      Lwt_tracing.wakeup (uid_of_internal_promise p) (Lwt_tracing.Wakeup_type result);
       let result = state_of_result result in
       let State_may_have_changed p =
         resolve ~maximum_callback_nesting_depth:1 p result in
@@ -1487,7 +1480,7 @@ struct
           | Not_cancelable ->
             callbacks_accumulator
           | Cancel_this_promise ->
-            Lwt_tracing.(!tracer.cancel (uid_of_internal_promise p));
+            Lwt_tracing.cancel (uid_of_internal_promise p);
             let State_may_have_changed p =
               set_promise_state p canceled_result in
             ignore p;
@@ -1530,53 +1523,50 @@ sig
   val fail_invalid_arg : string -> _ t
 end =
 struct
-  let return ?(uid = Lwt_tracing.fresh ()) v =
+  let return ?(promise_type=`Return) v =
+    let uid = Lwt_tracing.create_promise promise_type in
     let p = to_public_promise {state = Fulfilled v; uid} in
-    Lwt_tracing.(!tracer.create_promise uid `Return );
-    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+    Gc.finalise_last (fun () -> Lwt_tracing.promise_collected uid) p;
     p
 
+
   let of_result result =
-    let uid = Lwt_tracing.fresh () in
-    let p = to_public_promise {state = state_of_result result; uid} in
-    begin
+    let uid =
       match result with
       | Ok _ ->
-        Lwt_tracing.(!tracer.create_promise uid `Return );
+        Lwt_tracing.create_promise `Return
       | Error _ ->
-        Lwt_tracing.(!tracer.create_promise uid `Fail );
-    end;
-    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+        Lwt_tracing.create_promise `Fail
+    in
+    let p = to_public_promise {state = state_of_result result; uid} in
+    Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
     p
 
   let fail exn =
-    let uid = Lwt_tracing.fresh () in
+    let uid = Lwt_tracing.create_promise `Fail in
     let p = to_public_promise {state = Rejected exn; uid} in
-    Lwt_tracing.(!tracer.create_promise uid `Fail );
-    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+    Gc.finalise_last (fun () -> Lwt_tracing.promise_collected uid) p;
     p
 
-  let return_unit = return ~uid:(Lwt_tracing.uid_of_static_promise `Return_unit) ()
-  let return_none = return ~uid:(Lwt_tracing.uid_of_static_promise `Return_none) None
+  let return_unit = return ~promise_type:(`Return_unit) ()
+  let return_none = return ~promise_type:(`Return_none) None
   let return_some x = return (Some x)
-  let return_nil = return ~uid:(Lwt_tracing.uid_of_static_promise `Return_nil) []
-  let return_true = return ~uid:(Lwt_tracing.uid_of_static_promise `Return_true) true
-  let return_false = return ~uid:(Lwt_tracing.uid_of_static_promise `Return_false) false
+  let return_nil = return ~promise_type:(`Return_nil) []
+  let return_true = return ~promise_type:(`Return_true) true
+  let return_false = return ~promise_type:(`Return_false) false
   let return_ok x = return (Result.Ok x)
   let return_error x = return (Result.Error x)
 
   let fail_with msg =
-    let uid = Lwt_tracing.fresh () in
+    let uid = Lwt_tracing.create_promise `Fail in
     let p = to_public_promise {state = Rejected (Failure msg); uid} in
-    Lwt_tracing.(!tracer.create_promise uid `Fail );
-    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+    Gc.finalise_last (fun () -> Lwt_tracing.promise_collected uid) p;
     p
 
   let fail_invalid_arg msg =
-    let uid = Lwt_tracing.fresh () in
+    let uid = Lwt_tracing.create_promise `Fail in
     let p = to_public_promise {state = Rejected (Invalid_argument msg); uid} in
-    Lwt_tracing.(!tracer.create_promise uid `Fail );
-    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+    Gc.finalise_last (fun () -> Lwt_tracing.promise_collected uid) p;
     p
 
   let return v = return v
@@ -1614,10 +1604,9 @@ struct
         cleanups_deferred = 0;
       }
     in
-    let uid = Lwt_tracing.fresh () in
+    let uid = Lwt_tracing.create_promise promise_type in
     let p = {state; uid} in
-    Lwt_tracing.(!tracer.create_promise uid promise_type);
-    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+    Gc.finalise_last (fun () -> Lwt_tracing.promise_collected uid) p;
     p
 
 
@@ -1660,11 +1649,9 @@ struct
     let node = cast_sequence_node node p in
 
     let Pending callbacks = p.state in
-    let cuid = callback_fresh () in
-    let cty = Lwt_tracing.Add_task_r in
-    Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
+    let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Add_task_r ()) in
     let callback = Cancel_callback_list_remove_sequence_node (cuid,node) in
-    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+    Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
     callbacks.cancel_callbacks <- callback;
 
     to_public_promise p
@@ -1675,11 +1662,9 @@ struct
     let node = cast_sequence_node node p in
 
     let Pending callbacks = p.state in
-    let cuid = callback_fresh () in
-    let cty = Lwt_tracing.Add_task_l in
-    Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
+    let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Add_task_l ()) in
     let callback = Cancel_callback_list_remove_sequence_node (cuid, node) in
-    Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+    Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
     callbacks.cancel_callbacks <- callback;
 
     to_public_promise p
@@ -1718,20 +1703,16 @@ struct
       in
 
       let remove_the_callback =
-        let cuid = callback_fresh () in
-        let cty = Lwt_tracing.Protected in
-        Lwt_tracing.(!tracer.attach_callback (uid_of_promise p) cuid cty);
-        Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+        let cuid = Lwt_tracing.(attach_callback (uid_of_promise p) Protected ()) in
+        Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
         add_explicitly_removable_callback_and_give_remove_function
           [p] (cuid,callback)
       in
 
       let Pending p'_callbacks = p'.state in
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.Cancel in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p') cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) remove_the_callback;
-      add_cancel_callback p'_callbacks (cuid,remove_the_callback);
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p') Cancel ()) in
+      Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) remove_the_callback;
+      add_cancel_callback p'_callbacks (cuid, remove_the_callback);
 
       to_public_promise p'
 
@@ -1756,10 +1737,8 @@ struct
           resolve ~allow_deferring:false p' p_result in
         ignore p'
       in
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.No_cancel in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_promise p) cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_promise p) No_cancel ()) in
+      Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
       add_implicitly_removed_callback p_callbacks (cuid,callback);
 
       to_public_promise p'
@@ -1863,7 +1842,7 @@ struct
     (* Using [p'] as it's the name used inside [bind], etc., for promises with
        this role -- [p'] is the promise returned by the user's function. *)
     let p' = underlying user_provided_promise in
-    Lwt_tracing.(!tracer.proxy (uid_of_internal_promise user_provided_promise)
+    Lwt_tracing.(proxy ~proxy:(uid_of_internal_promise user_provided_promise)
                    (uid_of_internal_promise outer_promise));
     if identical p' outer_promise then
       State_may_have_changed p'
@@ -1979,33 +1958,26 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.Bind (`Eager, f) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Bind (FPFulfilled (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
             f v)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          let cuid = callback_fresh () in
-          let cty = Lwt_tracing.Bind (`Deferred, f) in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Bind (FPFulfilled (`Deferred, f))) in
+          Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
           (p'', (cuid,callback), p.state))
 
     | Rejected _ as result ->
-      let uid = Lwt_tracing.fresh () in
+      let uid = Lwt_tracing.create_promise `Fail in
       let p = to_public_promise {state = result; uid} in
-      Lwt_tracing.(!tracer.create_promise uid `Fail);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+      Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
       p
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.Bind (`Pending, f) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Bind (FPPending f)) in
+      Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
       add_implicitly_removed_callback p_callbacks (cuid,callback);
       p''
 
@@ -2050,33 +2022,26 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.Backtrace_bind (`Eager, f) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Backtrace_bind (FPFulfilled (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
             f v)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          let cuid = callback_fresh () in
-          let cty = Lwt_tracing.Backtrace_bind (`Deferred, f) in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Backtrace_bind (FPFulfilled (`Deferred, f))) in
+          Gc.finalise_last (fun () -> Lwt_tracing.(callback_collected cuid)) callback;
           (p'', (cuid,callback), p.state))
 
     | Rejected exn ->
-      let uid = Lwt_tracing.fresh () in
+      let uid = Lwt_tracing.create_promise `Fail in
       let p = to_public_promise {state = Rejected (add_loc exn); uid} in
-      Lwt_tracing.(!tracer.create_promise uid `Fail);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+      Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
       p
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.Backtrace_bind (`Pending, f) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Backtrace_bind (FPPending f)) in
+      Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
       add_implicitly_removed_callback p_callbacks (cuid,callback);
       p''
 
@@ -2120,38 +2085,30 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-          let cuid = callback_fresh () in
-          let cty = Lwt_tracing.Map (`Eager, f) in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-          Lwt_tracing.(!tracer.resolve cuid);
-          let uid = Lwt_tracing.fresh () in
-          let p = to_public_promise
-            {state = (try Fulfilled (f v) with exn -> Rejected exn); uid} in
-          Lwt_tracing.(!tracer.create_promise uid `Fail);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
-          p)
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Map (FPFulfilled (`Eager, f))) in
+            let uid = Lwt_tracing.create_promise `Fail in
+            let f = Lwt_tracing.resolve cuid f in
+            let p = to_public_promise
+                {state = (try Fulfilled (f v) with exn -> Rejected exn); uid} in
+            Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
+            p)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          let cuid = callback_fresh () in
-          let cty = Lwt_tracing.Map (`Deferred, f) in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Map (FPFulfilled (`Deferred, f))) in
+          Gc.finalise_last (fun () -> Lwt_tracing.(callback_collected cuid)) callback;
           (p'', (cuid,callback), p.state))
 
     | Rejected _ as result ->
-      let uid = Lwt_tracing.fresh () in
+      let uid = Lwt_tracing.create_promise `Fail in
       let p = to_public_promise {state = result; uid} in
-      Lwt_tracing.(!tracer.create_promise uid `Fail);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+      Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
       p
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.Map (`Pending, f) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Map (FPPending f)) in
+      Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
       add_implicitly_removed_callback p_callbacks (cuid,callback);
       p''
 
@@ -2201,26 +2158,20 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.Catch (`Eager, h) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Catch (RPRejected (`Eager, h))) in
+            let h = Lwt_tracing.resolve cuid h in
             h exn)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          let cuid = callback_fresh () in
-          let cty = Lwt_tracing.Catch (`Deferred, h) in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Catch (RPRejected (`Deferred, h))) in
+          Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
           (p'', (cuid,callback), p.state))
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.Catch (`Pending, h) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Catch (RPPending f)) in
+      Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
       add_implicitly_removed_callback p_callbacks (cuid,callback);
       p''
 
@@ -2269,26 +2220,20 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.Backtrace_catch (`Eager, h) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Backtrace_catch (RPRejected (`Eager, h))) in
+            let h = Lwt_tracing.resolve cuid h in
             h exn)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          let cuid = callback_fresh () in
-          let cty = Lwt_tracing.Backtrace_catch (`Deferred, h) in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Backtrace_catch (RPRejected (`Deferred, h))) in
+          Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
           (p'', (cuid,callback), p.state))
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.Backtrace_catch (`Pending, h) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Backtrace_catch (RPPending f)) in
+      Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
       add_implicitly_removed_callback p_callbacks (cuid,callback);
       p''
 
@@ -2339,44 +2284,34 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.(Try_bind (`Eager, TFulfilled f')) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Try_bind (FRPFulfilled (`Eager, f'))) in
+            let f' = Lwt_tracing.resolve cuid f' in
             f' v)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          let cuid = callback_fresh () in
-          let cty = Lwt_tracing.(Try_bind (`Deferred, TFulfilled f')) in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Try_bind (FRPFulfilled (`Deferred, f'))) in
+          Gc.finalise_last (fun () -> Lwt_tracing.(callback_collected cuid)) callback;
           (p'', (cuid,callback), p.state))
 
     | Rejected exn ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.(Try_bind (`Eager, TRejected h)) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Try_bind (FRPRejected (`Eager, h))) in
+            let h = Lwt_tracing.resolve cuid h in
             h exn)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          let cuid = callback_fresh () in
-          let cty = Lwt_tracing.(Try_bind (`Deferred, TRejected h)) in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Try_bind (FRPRejected (`Deferred, h))) in
+          Gc.finalise_last (fun () -> Lwt_tracing.(callback_collected cuid)) callback;
           (p'', (cuid, callback), p.state))
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.(Try_bind (`Pending, TPending ( f', h))) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Try_bind (FRPPending (f', h))) in
+      Gc.finalise_last (fun () -> Lwt_tracing.(callback_collected cuid)) callback;
       add_implicitly_removed_callback p_callbacks (cuid, callback);
       p''
 
@@ -2427,44 +2362,34 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.(Backtrace_try_bind (`Eager, TFulfilled f')) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Backtrace_try_bind (FRPFulfilled (`Eager, f'))) in
+            let f' = Lwt_tracing.resolve cuid f' in
             f' v)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          let cuid = callback_fresh () in
-          let cty = Lwt_tracing.(Backtrace_try_bind (`Deferred, TFulfilled f')) in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Backtrace_try_bind (FRPFulfilled (`Deferred, f'))) in
+          Gc.finalise_last (fun () -> Lwt_tracing.(callback_collected cuid)) callback;
           (p'', (cuid, callback), p.state))
 
     | Rejected exn ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.(Backtrace_try_bind (`Eager, TRejected h)) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Backtrace_try_bind (FRPRejected (`Eager, h))) in
+            let h = Lwt_tracing.resolve cuid h in
             h (add_loc exn))
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          let cuid = callback_fresh () in
-          let cty = Lwt_tracing.(Backtrace_try_bind (`Deferred, TRejected h)) in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Backtrace_try_bind (FRPRejected (`Deferred, h))) in
+          Gc.finalise_last (fun () -> Lwt_tracing.(callback_collected cuid)) callback;
           (p'', (cuid, callback), p.state))
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.(Backtrace_try_bind (`Pending, TPending (f', h))) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_promise p'') cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Backtrace_try_bind (FRPPending (f', h))) in
+      Gc.finalise_last (fun () -> Lwt_tracing.(callback_collected cuid)) callback;
       add_implicitly_removed_callback p_callbacks (cuid, callback);
       p''
 
@@ -2489,15 +2414,11 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.On_cancel (`Eager, f) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_cancel (RPRejected (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
             handle_with_async_exception_hook (cuid, f) ())
         ~if_deferred:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.On_cancel (`Deferred, f) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
+          let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_cancel (RPRejected (`Deferred, f))) in
           ((), (cuid, (fun _ -> handle_with_async_exception_hook (cuid,f) ())), Fulfilled ()))
 
     | Rejected _ ->
@@ -2507,9 +2428,7 @@ struct
       ()
 
     | Pending callbacks ->
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.On_cancel (`Pending, f) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_cancel (RPPending f)) in
       add_cancel_callback callbacks (cuid, f)
 
 
@@ -2536,28 +2455,22 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.On_success (`Eager, f) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_success (FPFulfilled (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
             handle_with_async_exception_hook (cuid,f) v)
         ~if_deferred:(fun () ->
-            let cuid = callback_fresh () in
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_success (FPFulfilled (`Deferred, f))) in
             let callback = callback_if_deferred cuid in
-            let cty = Lwt_tracing.On_success (`Deferred, callback) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+            Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
           ((), (cuid, callback), p.state))
 
     | Rejected _ ->
       ()
 
     | Pending p_callbacks ->
-      let cuid = callback_fresh () in
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_success (FPPending f)) in
       let callback = callback_if_deferred cuid in
-      let cty = Lwt_tracing.On_success (`Pending, f) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      Gc.finalise_last (fun () -> Lwt_tracing.(callback_collected cuid)) callback;
       add_implicitly_removed_callback p_callbacks (cuid, callback)
 
   let on_failure p f =
@@ -2585,25 +2498,19 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.On_failure (`Eager, f) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_failure (RPRejected (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
             handle_with_async_exception_hook (cuid,f) exn)
         ~if_deferred:(fun () ->
-            let cuid = callback_fresh () in
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_failure (RPRejected (`Deferred, f))) in
             let callback = callback_if_deferred cuid in
-            let cty = Lwt_tracing.On_failure (`Deferred, callback) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+            Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
           ((), (cuid, callback), p.state))
 
     | Pending p_callbacks ->
-      let cuid = callback_fresh () in
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_failure (RPPending f)) in
       let callback = callback_if_deferred cuid in
-      let cty = Lwt_tracing.On_failure (`Pending, f) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      Gc.finalise_last (fun () -> Lwt_tracing.(callback_collected cuid)) callback;
       add_implicitly_removed_callback p_callbacks (cuid, callback)
 
   let on_termination p f =
@@ -2623,42 +2530,32 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.On_termination (`Eager, f) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_termination (FRPFulfilled (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
             handle_with_async_exception_hook (cuid, f) ())
         ~if_deferred:(fun () ->
-            let cuid = callback_fresh () in
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_termination (FRPFulfilled (`Deferred, f))) in
             let callback = callback_if_deferred cuid in
-            let cty = Lwt_tracing.On_termination (`Deferred, callback) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
-          ((), (cuid, callback), p.state))
+            Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
+            ((), (cuid, callback), p.state))
 
     | Rejected _ ->
       run_callback_or_defer_it
       ~run_immediately_and_ensure_tail_call:true
       ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.On_termination (`Eager, f) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
-          handle_with_async_exception_hook (cuid, f) ())
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_termination (FRPRejected (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
+            handle_with_async_exception_hook (cuid, f) ())
       ~if_deferred:(fun () ->
-          let cuid = callback_fresh () in
+          let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_termination (FRPRejected (`Deferred, f))) in
           let callback = callback_if_deferred cuid in
-          let cty = Lwt_tracing.On_termination (`Deferred, callback) in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+          Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
           ((), (cuid, callback), p.state))
 
     | Pending p_callbacks ->
-      let cuid = callback_fresh () in
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_termination (FRPPending (f,f))) in
       let callback = callback_if_deferred cuid in
-      let cty = Lwt_tracing.On_termination (`Pending, f) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      Gc.finalise_last (fun () -> Lwt_tracing.(callback_collected cuid)) callback;
       add_implicitly_removed_callback p_callbacks (cuid, callback)
 
   let on_any p f g =
@@ -2684,42 +2581,32 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.(On_any (`Eager, TFulfilled f)) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_any (FRPFulfilled (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
             handle_with_async_exception_hook (cuid,f) v)
         ~if_deferred:(fun () ->
-          let cuid = callback_fresh () in
-          let callback = callback_if_deferred cuid in
-          let cty = Lwt_tracing.(On_any (`Deferred, TFulfilled f)) in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_any (FRPFulfilled (`Deferred, f))) in
+            let callback = callback_if_deferred cuid in
+            Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
           ((), (cuid, callback), p.state))
 
     | Rejected exn ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-            let cuid = callback_fresh () in
-            let cty = Lwt_tracing.(On_any (`Eager, TRejected g)) in
-            Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-            Lwt_tracing.(!tracer.resolve cuid);
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_any (FRPRejected (`Eager, g))) in
+            let g = Lwt_tracing.resolve cuid g in
             handle_with_async_exception_hook (cuid, g) exn)
         ~if_deferred:(fun () ->
-          let cuid = callback_fresh () in
+          let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_any (FRPRejected (`Deferred, g))) in
           let callback = callback_if_deferred cuid in
-          let cty = Lwt_tracing.(On_any (`Deferred, TRejected g)) in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+          Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
           ((), (cuid, callback), p.state))
 
     | Pending p_callbacks ->
-      let cuid = callback_fresh () in
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_any (FRPPending (f,g))) in
       let callback = callback_if_deferred cuid in
-      let cty = Lwt_tracing.(On_any (`Pending, TPending (f,g))) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      Gc.finalise_last (fun () -> Lwt_tracing.(callback_collected cuid)) callback;
       add_implicitly_removed_callback p_callbacks (cuid, callback)
 end
 include Sequential_composition
@@ -2778,10 +2665,8 @@ struct
         | Rejected exn ->
           !async_exception_hook exn
       in
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.(Async) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Async ()) in
+      Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
       add_implicitly_removed_callback p_callbacks (cuid, callback)
 
   let ignore_result p =
@@ -2801,10 +2686,8 @@ struct
         | Rejected exn ->
           !async_exception_hook exn
       in
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.(Ignore_result) in
-      Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Ignore_result ()) in
+      Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
       add_implicitly_removed_callback p_callbacks (cuid, callback)
 
 
@@ -2848,14 +2731,16 @@ struct
       match ps with
       | [] ->
         if !number_pending_in_ps = 0 then (
-          let uid = Lwt_tracing.fresh () in
-          let p = to_public_promise {state = !join_result; uid} in
-          begin
+          let uid,p =
             match !join_result with
-            | Fulfilled () ->  Lwt_tracing.(!tracer.create_promise uid `Return)
-            | Rejected _ -> Lwt_tracing.(!tracer.create_promise uid `Fail)
-          end;
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+            | Fulfilled () ->
+              let uid = Lwt_tracing.create_promise `Return in
+              uid, to_public_promise {state = !join_result; uid}
+            | Rejected _ ->
+              let uid = Lwt_tracing.create_promise `Fail in
+              uid, to_public_promise {state = !join_result; uid}
+          in
+          Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
           p
         )
         else
@@ -2867,9 +2752,8 @@ struct
         match (underlying p).state with
         | Pending p_callbacks ->
           number_pending_in_ps := !number_pending_in_ps + 1;
-          let cuid = callback_fresh () in
-          Lwt_tracing.(!tracer.attach_callback (uid_of_internal_promise p) cuid cty);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+          let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Join ()) in
+          Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
           add_implicitly_removed_callback p_callbacks (cuid, callback);
           attach_callback_or_resolve_immediately ~cty ps
 
@@ -3005,11 +2889,9 @@ struct
           resolve ~allow_deferring:false p result in
         ignore p
       in
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.(Choose) in
-      List.iter (fun p ->
-          Lwt_tracing.(!tracer.attach_callback (uid_of_promise p) cuid cty)) ps;
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      let promise_uid_list = List.map uid_of_promise ps in
+      let cuid = Lwt_tracing.(attach_callback_list promise_uid_list Choose ()) in
+      Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
       add_explicitly_removable_callback_to_each_of ps (cuid, callback);
 
       to_public_promise p
@@ -3035,11 +2917,9 @@ struct
           resolve ~allow_deferring:false p result in
         ignore p
       in
-      let cuid = callback_fresh () in
-      let cty = Lwt_tracing.(Pick) in
-      List.iter (fun p ->
-          Lwt_tracing.(!tracer.attach_callback (uid_of_promise p) cuid cty)) ps;
-      Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+      let promise_uid_list = List.map uid_of_promise ps in
+      let cuid = Lwt_tracing.(attach_callback_list promise_uid_list Pick ()) in
+      Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
       add_explicitly_removable_callback_to_each_of ps (cuid, callback);
 
       to_public_promise p
@@ -3099,10 +2979,9 @@ struct
           collect_already_fulfilled_promises_or_find_rejected (v::acc) ps
 
         | Rejected _ as result ->
-          let uid = Lwt_tracing.fresh () in
+          let uid = Lwt_tracing.create_promise `Fail in
           let p = to_public_promise {state = result; uid} in
-          Lwt_tracing.(!tracer.create_promise uid `Fail);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+          Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
           p
 
         | Pending _ ->
@@ -3125,11 +3004,9 @@ struct
             resolve ~allow_deferring:false p result in
           ignore p
         in
-        let cuid = callback_fresh () in
-        let cty = Lwt_tracing.(Nchoose) in
-        List.iter (fun p ->
-            Lwt_tracing.(!tracer.attach_callback (uid_of_promise p) cuid cty)) ps;
-        Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+        let promise_uid_list = List.map uid_of_promise ps in
+        let cuid = Lwt_tracing.(attach_callback_list promise_uid_list Nchoose ()) in
+        Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
         add_explicitly_removable_callback_to_each_of ps (cuid, callback);
 
         to_public_promise p
@@ -3141,10 +3018,9 @@ struct
           collect_already_fulfilled_promises_or_find_rejected [v] ps
 
         | Rejected _ as result ->
-          let uid = Lwt_tracing.fresh () in
+          let uid = Lwt_tracing.create_promise `Fail in
           let p = to_public_promise {state = result; uid} in
-          Lwt_tracing.(!tracer.create_promise uid `Fail);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+          Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
           p
 
         | Pending _ ->
@@ -3173,10 +3049,9 @@ struct
 
         | Rejected _ as result ->
           List.iter cancel ps;
-          let uid = Lwt_tracing.fresh () in
+          let uid = Lwt_tracing.create_promise `Fail in
           let p = to_public_promise {state = result; uid} in
-          Lwt_tracing.(!tracer.create_promise uid `Fail);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+          Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
           p
 
         | Pending _ ->
@@ -3197,11 +3072,9 @@ struct
             resolve ~allow_deferring:false p result in
           ignore p
         in
-        let cuid = callback_fresh () in
-        let cty = Lwt_tracing.(Npick) in
-        List.iter (fun p ->
-            Lwt_tracing.(!tracer.attach_callback (uid_of_promise p) cuid cty)) ps;
-        Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+        let promise_uid_list = List.map uid_of_promise ps in
+        let cuid = Lwt_tracing.(attach_callback_list promise_uid_list Npick ()) in
+        Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
         add_explicitly_removable_callback_to_each_of ps (cuid, callback);
 
         to_public_promise p
@@ -3214,10 +3087,10 @@ struct
 
         | Rejected _ as result ->
           List.iter cancel ps;
-          let uid = Lwt_tracing.fresh () in
+          let uid = Lwt_tracing.create_promise `Fail in
           let p = to_public_promise {state = result; uid} in
           Lwt_tracing.(!tracer.create_promise uid `Fail);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+          Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
           p
 
         | Pending _ ->
@@ -3273,9 +3146,10 @@ struct
           collect_already_resolved_promises (v::results) pending ps
 
         | Rejected _ as result ->
-          let uid = Lwt_tracing.fresh () in
-          to_public_promise {state = result ; uid}
-
+          let uid = Lwt_tracing.create_promise `Fail in
+          let p = to_public_promise {state = result ; uid} in
+          Gc.finalise_last (fun () -> Lwt_tracing.promise_collected uid) p;
+          p
         | Pending _ ->
           collect_already_resolved_promises results (p::pending) ps
     in
@@ -3291,11 +3165,9 @@ struct
           let State_may_have_changed p = finish p [] [] ps in
           ignore p
         in
-        let cuid = callback_fresh () in
-        let cty = Lwt_tracing.(Nchoose_split) in
-        List.iter (fun p ->
-            Lwt_tracing.(!tracer.attach_callback (uid_of_promise p) cuid cty)) ps;
-        Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.callback_destroy cuid)) callback;
+        let promise_uid_list = List.map uid_of_promise ps in
+        let cuid = Lwt_tracing.(attach_callback_list promise_uid_list Nchoose_split ()) in
+        Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid) callback;
         add_explicitly_removable_callback_to_each_of ps (cuid, callback);
 
         to_public_promise p
@@ -3307,10 +3179,9 @@ struct
           collect_already_resolved_promises [v] pending_acc ps'
 
         | Rejected _ as result ->
-          let uid = Lwt_tracing.fresh () in
+          let uid = Lwt_tracing.create_promise `Fail in
           let p = to_public_promise {state = result; uid} in
-          Lwt_tracing.(!tracer.create_promise uid `Fail);
-          Gc.finalise_last (fun () -> Lwt_tracing.(!tracer.promise_destroy uid)) p;
+          Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
           p
 
         | Pending _ ->
