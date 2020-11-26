@@ -215,8 +215,8 @@ type tracer =
        is stored. *)
 
     proxy : promise_uid -> promise_uid -> unit;
-    (** Proxy p p' means that p is a proxy for p'. This means they
-        should behave the same way. *)
+    (** Called when [p] is made into a proxy of [p']. This means they
+        should behave the same way. Called for sequential operators. *)
 
     detach_callback : promise_uid -> callback_uid -> unit;
     (** Called when a callback is detached from a promise *)
