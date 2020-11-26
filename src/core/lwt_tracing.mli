@@ -175,7 +175,7 @@ val detach_callback : promise_uid -> callback_uid -> unit
 val promise_collected : promise_uid -> unit
 
 (** A wrapper for [callback_collected]. *)
-val callback_collected : callback_uid -> unit
+val callback_collected : callback_uid -> on_heap:bool -> unit
 
 
 (** {2: User interface} *)
@@ -224,11 +224,13 @@ type tracer =
     promise_collected : promise_uid -> unit;
     (** Called when a promise is collected by the GC. *)
 
-    callback_collected : callback_uid -> unit;
-    (** Called when a callback created by Lwt is collected by the
-       GC. This callback can be a wrapper around a callback given by
-       the user via a function such as [Lwt.bind]. See
-       [attached_strategy] for more information. *)
+    callback_collected : callback_uid -> on_heap:bool -> unit;
+    (** Called when a callback created by Lwt is collected by the GC
+       if [on_heap] is true. If [on_heap] false, called juste after
+       [attach_callback] to notify that the callback does not need to
+       be collected by the GC. This callback can be a wrapper around a
+       callback given by the user via a function such as
+       [Lwt.bind]. See [attached_strategy] for more information. *)
 
   }
 

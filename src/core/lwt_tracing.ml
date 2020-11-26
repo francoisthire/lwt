@@ -115,7 +115,7 @@ type tracer =
 
     promise_collected : promise_uid -> unit;
 
-    callback_collected : callback_uid -> unit;
+    callback_collected : callback_uid -> on_heap:bool -> unit;
   }
 
 
@@ -137,7 +137,8 @@ let null_tracer =
 
     promise_collected  = (fun _ -> ());
 
-    callback_collected = (fun _ -> ());
+    callback_collected = (fun _ ~on_heap:_ -> ());
+  }
   }
 
 let tracer = ref null_tracer
@@ -194,6 +195,6 @@ let promise_collected promise_uid =
   !tracer.promise_collected promise_uid
 [@@ inlined]
 
-let callback_collected callback_uid =
-  !tracer.callback_collected callback_uid
+let callback_collected callback_uid ~on_heap =
+  !tracer.callback_collected callback_uid ~on_heap
 [@@ inlined]
