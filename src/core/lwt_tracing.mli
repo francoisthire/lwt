@@ -239,3 +239,7 @@ val null_tracer : tracer
 
 (** Tracer reference that can be changed by the user *)
 val tracer : tracer ref
+
+val counter_tracer : tracer
+
+val pp_trace_counter : unit -> unit

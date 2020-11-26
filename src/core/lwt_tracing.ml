@@ -139,9 +139,81 @@ let null_tracer =
 
     callback_collected = (fun _ ~on_heap:_ -> ());
   }
+
+module type C =
+sig
+  val name : string
+
+  val counter : int ref
+end
+
+let make_counter : string -> (module C) =
+  fun s ->
+    (module struct
+      let name = s
+
+      let counter = ref 0
+    end)
+
+let incr : (module C) -> unit = fun (module C) -> incr C.counter
+
+let pp_counter : Format.formatter -> (module C) -> unit = fun fmt (module C) ->
+  Format.fprintf fmt "%s: %d@." C.name !C.counter
+
+let create_promise_counter = make_counter "create_promise"
+
+let attack_callback_counter = make_counter "attack_callback_counter"
+
+let wakeup_counter = make_counter "wakeup_counter"
+
+let cancel_counter = make_counter "cancel_counter"
+
+let resolve_counter = make_counter "resolve_counter"
+
+let proxy_counter = make_counter "proxy_counter"
+
+let detach_callback_counter = make_counter "detach_callback"
+
+let promise_collected_counter = make_counter "promise_collected"
+
+let callback_collected_counter = make_counter "callback_collected"
+
+let counter_tracer =
+  {
+    create_promise = (fun _ _ -> incr create_promise_counter);
+
+    attach_callback = (fun _ _ _ _ -> incr attack_callback_counter);
+
+    wakeup  = (fun _ _ -> incr wakeup_counter);
+
+    cancel = (fun _ -> incr cancel_counter);
+
+    resolve = (fun _ x -> incr resolve_counter; x);
+
+    proxy = (fun _ _ -> incr proxy_counter);
+
+    detach_callback = (fun _ _ -> incr detach_callback_counter);
+
+    promise_collected = (fun _  -> incr promise_collected_counter);
+
+    callback_collected = (fun _ ~on_heap:_ -> incr callback_collected_counter);
   }
 
 let tracer = ref null_tracer
+
+let _ =
+  tracer := counter_tracer
+
+let pp_trace_counter () =
+  Format.eprintf "%a@." pp_counter create_promise_counter;
+  Format.eprintf "%a@." pp_counter attack_callback_counter;
+  Format.eprintf "%a@." pp_counter wakeup_counter;
+  Format.eprintf "%a@." pp_counter cancel_counter;
+  Format.eprintf "%a@." pp_counter resolve_counter;
+  Format.eprintf "%a@." pp_counter proxy_counter;
+  Format.eprintf "%a@." pp_counter detach_callback_counter;
+  Format.eprintf "%a@." pp_counter promise_collected_counter;
+  Format.eprintf "%a@." pp_counter callback_collected_counter
 
 
 let [@inline] create_promise promise_type =
