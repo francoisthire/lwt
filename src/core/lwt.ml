@@ -377,7 +377,14 @@ module Storage_map =
     end)
 type storage = (unit -> unit) Storage_map.t
 
+(* Profiling *)
 
+let if_callback_collected cuid callback =
+  try
+    Gc.finalise_last (fun () -> Lwt_tracing.callback_collected cuid ~on_heap:true) callback;
+  with _ ->
+    Lwt_tracing.callback_collected cuid ~on_heap:false
+[@@ inlined]
 
 module Main_internal_types =
 struct
@@ -397,11 +404,11 @@ struct
   [@@@ocaml.warning "+37"]
 
 
-
   (* Promises proper. *)
 
   type ('a, 'u, 'c) promise = {
     mutable state : ('a, 'u, 'c) state;
+    uid: Lwt_tracing.promise_uid; (* Profiling *)
   }
 
   and (_, _, _) state =
@@ -448,9 +455,9 @@ struct
     mutable cleanups_deferred : int;
   }
 
-  and 'a regular_callback = 'a resolved_state -> unit
+  and 'a regular_callback = Lwt_tracing.callback_uid * ('a resolved_state -> unit)
 
-  and cancel_callback = unit -> unit
+  and cancel_callback = Lwt_tracing.callback_uid * (unit -> unit)
 
   and 'a resolved_state = ('a, underlying, resolved) state
 
@@ -479,7 +486,7 @@ struct
       storage * cancel_callback ->
         _ cancel_callback_list
     | Cancel_callback_list_remove_sequence_node :
-      ('a, _, _) promise Lwt_sequence.node ->
+      Lwt_tracing.callback_uid * ('a, _, _) promise Lwt_sequence.node ->
         'a cancel_callback_list
 
   (* Notes:
@@ -539,10 +546,13 @@ struct
 
      - The [cleanups_deferred] field is explained in module
        [Pending_callbacks]. *)
+
+
+  (* profiling *)
+  let uid_of_internal_promise {uid; _} = uid
+
 end
 open Main_internal_types
-
-
 
 module Public_types =
 struct
@@ -593,6 +603,12 @@ struct
   let state_of_result = function
     | Result.Ok x -> Fulfilled x
     | Result.Error exn -> Rejected exn
+
+  (* Profiling *)
+  let uid_of_promise t =
+    let Internal {uid; _} = to_internal_promise t in
+    uid
+
 end
 include Public_types
 
@@ -832,7 +848,7 @@ sig
     'a t list -> 'a regular_callback -> unit
   val add_explicitly_removable_callback_and_give_remove_function :
     'a t list -> 'a regular_callback -> (unit -> unit)
-  val add_cancel_callback : 'a callbacks -> (unit -> unit) -> unit
+  val add_cancel_callback : 'a callbacks -> Lwt_tracing.callback_uid * (unit -> unit) -> unit
   val merge_callbacks : from:'a callbacks -> into:'a callbacks -> unit
 end =
 struct
@@ -888,13 +904,14 @@ struct
      to clean the callback list (right after clearing a cell). When the counter
      reaches [cleanup_throttle], the callback list is actually scanned and
      cleared callback cells are removed. *)
-  let clear_explicitly_removable_callback_cell cell ~originally_added_to:ps =
+  let clear_explicitly_removable_callback_cell cuid cell ~originally_added_to:ps =
     cell := None;
 
     (* Go through the promises the cell had originally been added to, and either
        defer a cleanup, or actually clean up their callback lists. *)
     ps |> List.iter (fun p ->
-      let Internal p = to_internal_promise p in
+        let Internal p = to_internal_promise p in
+        Lwt_tracing.(detach_callback (uid_of_internal_promise p) cuid);
       match (underlying p).state with
       (* Some of the promises may already have been resolved at the time this
          function is called. *)
@@ -906,7 +923,9 @@ struct
         (* If the promise has only one regular callback, and it is removable, it
            must have been the cell cleared in this function, above. In that
            case, just set its callback list to empty. *)
-        | Regular_callback_list_explicitly_removable_callback _ ->
+        | Regular_callback_list_explicitly_removable_callback {contents = Some (_,_)} ->
+          callbacks.regular_callbacks <- Regular_callback_list_empty
+        | Regular_callback_list_explicitly_removable_callback {contents = None} ->
           callbacks.regular_callbacks <- Regular_callback_list_empty
 
         (* Maintainer's note: I think this function shouldn't try to trigger a
@@ -917,6 +936,7 @@ struct
         | Regular_callback_list_concat _ ->
           let cleanups_deferred = callbacks.cleanups_deferred + 1 in
           if cleanups_deferred > cleanup_throttle then begin
+            (* only this callback can be cleaned up *)
             callbacks.cleanups_deferred <- 0;
             callbacks.regular_callbacks <-
               clean_up_callback_cells callbacks.regular_callbacks
@@ -976,10 +996,10 @@ struct
 
      This is an internal function, indirectly used by the implementations of
      [Lwt.choose] and related functions. *)
-  let add_explicitly_removable_callback_and_give_cell ps f =
-    let rec cell = ref (Some self_removing_callback_wrapper)
+  let add_explicitly_removable_callback_and_give_cell ps (id,f) =
+    let rec cell = ref (Some (id, self_removing_callback_wrapper))
     and self_removing_callback_wrapper result =
-      clear_explicitly_removable_callback_cell cell ~originally_added_to:ps;
+      clear_explicitly_removable_callback_cell id cell ~originally_added_to:ps;
       f result
     in
 
@@ -998,14 +1018,14 @@ struct
 
   (* This is basically just to support [Lwt.protected], which needs to remove
      the callback in circumstances other than the callback being called. *)
-  let add_explicitly_removable_callback_and_give_remove_function ps f =
-    let cell = add_explicitly_removable_callback_and_give_cell ps f in
+  let add_explicitly_removable_callback_and_give_remove_function ps (id,f) =
+    let cell = add_explicitly_removable_callback_and_give_cell ps (id,f) in
     fun () ->
-      clear_explicitly_removable_callback_cell cell ~originally_added_to:ps
+      clear_explicitly_removable_callback_cell id cell ~originally_added_to:ps
 
   let add_cancel_callback callbacks f =
     (* Ugly cast :( *)
-    let cast_cancel_callback : (unit -> unit) -> cancel_callback = Obj.magic in
+    let cast_cancel_callback : Lwt_tracing.callback_uid * (unit -> unit) -> cancel_callback = Obj.magic in
     let f = cast_cancel_callback f in
 
     let node = Cancel_callback_list_callback (!current_storage, f) in
@@ -1051,7 +1071,7 @@ sig
     if_deferred:(unit -> 'a * 'b regular_callback * 'b resolved_state) ->
       'a
 
-  val handle_with_async_exception_hook : ('a -> unit) -> 'a -> unit
+  val handle_with_async_exception_hook : (Lwt_tracing.callback_uid * ('a -> unit)) -> 'a -> unit
 
   (* Internal interface exposed to other modules in Lwt *)
   val abandon_wakeups : unit -> unit
@@ -1151,7 +1171,8 @@ struct
       flush stderr;
       exit 2)
 
-  let handle_with_async_exception_hook f v =
+  let handle_with_async_exception_hook (id,f) v =
+    let f = Lwt_tracing.resolve id f in
     (* Note that this function does not care if [f] evaluates to a promise. In
        particular, if [f v] evaluates to [p] and [p] is already rejected or will
        be reject later, it is not the responsibility of this function to pass
@@ -1186,8 +1207,9 @@ struct
           current_storage := storage;
           handle_with_async_exception_hook f ();
           iter_list rest
-        | Cancel_callback_list_remove_sequence_node node ->
-          Lwt_sequence.remove node;
+        | Cancel_callback_list_remove_sequence_node (id, node) ->
+          let f = Lwt_tracing.resolve id (fun () -> Lwt_sequence.remove node) in
+          f ();
           iter_list rest
         | Cancel_callback_list_concat (fs, fs') ->
           iter_callback_list fs (fs'::rest)
@@ -1207,14 +1229,16 @@ struct
         match fs with
         | Regular_callback_list_empty ->
           iter_list rest
-        | Regular_callback_list_implicitly_removed_callback f ->
+        | Regular_callback_list_implicitly_removed_callback (id,f) ->
+          let f = Lwt_tracing.resolve id f in
           f result;
           iter_list rest
         | Regular_callback_list_explicitly_removable_callback
             {contents = None} ->
           iter_list rest
         | Regular_callback_list_explicitly_removable_callback
-            {contents = Some f} ->
+            {contents = Some (id,f)} ->
+          let f = Lwt_tracing.resolve id f in
           f result;
           iter_list rest
         | Regular_callback_list_concat (fs, fs') ->
@@ -1383,6 +1407,7 @@ struct
       Printf.ksprintf invalid_arg "Lwt.%s" api_function_name
 
     | Pending _ ->
+      Lwt_tracing.wakeup (uid_of_internal_promise p) (Lwt_tracing.Wakeup_type result);
       let result = state_of_result result in
       let State_may_have_changed p = resolve ~allow_deferring:false p result in
       ignore p
@@ -1404,6 +1429,7 @@ struct
       Printf.ksprintf invalid_arg "Lwt.%s" api_function_name
 
     | Pending _ ->
+      Lwt_tracing.wakeup (uid_of_internal_promise p) (Lwt_tracing.Wakeup_type result);
       let result = state_of_result result in
       let State_may_have_changed p =
         resolve ~maximum_callback_nesting_depth:1 p result in
@@ -1459,6 +1485,7 @@ struct
           | Not_cancelable ->
             callbacks_accumulator
           | Cancel_this_promise ->
+            Lwt_tracing.cancel (uid_of_internal_promise p);
             let State_may_have_changed p =
               set_promise_state p canceled_result in
             ignore p;
@@ -1501,29 +1528,53 @@ sig
   val fail_invalid_arg : string -> _ t
 end =
 struct
-  let return v =
-    to_public_promise {state = Fulfilled v}
+  let return ?(promise_type=`Return) v =
+    let uid = Lwt_tracing.create_promise promise_type in
+    let p = to_public_promise {state = Fulfilled v; uid} in
+    Gc.finalise_last (fun () -> Lwt_tracing.promise_collected uid) p;
+    p
+
 
   let of_result result =
-    to_public_promise {state = state_of_result result}
+    let uid =
+      match result with
+      | Ok _ ->
+        Lwt_tracing.create_promise `Return
+      | Error _ ->
+        Lwt_tracing.create_promise `Fail
+    in
+    let p = to_public_promise {state = state_of_result result; uid} in
+    Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
+    p
 
   let fail exn =
-    to_public_promise {state = Rejected exn}
+    let uid = Lwt_tracing.create_promise `Fail in
+    let p = to_public_promise {state = Rejected exn; uid} in
+    Gc.finalise_last (fun () -> Lwt_tracing.promise_collected uid) p;
+    p
 
-  let return_unit = return ()
-  let return_none = return None
+  let return_unit = return ~promise_type:(`Return_unit) ()
+  let return_none = return ~promise_type:(`Return_none) None
   let return_some x = return (Some x)
-  let return_nil = return []
-  let return_true = return true
-  let return_false = return false
+  let return_nil = return ~promise_type:(`Return_nil) []
+  let return_true = return ~promise_type:(`Return_true) true
+  let return_false = return ~promise_type:(`Return_false) false
   let return_ok x = return (Result.Ok x)
   let return_error x = return (Result.Error x)
 
   let fail_with msg =
-    to_public_promise {state = Rejected (Failure msg)}
+    let uid = Lwt_tracing.create_promise `Fail in
+    let p = to_public_promise {state = Rejected (Failure msg); uid} in
+    Gc.finalise_last (fun () -> Lwt_tracing.promise_collected uid) p;
+    p
 
   let fail_invalid_arg msg =
-    to_public_promise {state = Rejected (Invalid_argument msg)}
+    let uid = Lwt_tracing.create_promise `Fail in
+    let p = to_public_promise {state = Rejected (Invalid_argument msg); uid} in
+    Gc.finalise_last (fun () -> Lwt_tracing.promise_collected uid) p;
+    p
+
+  let return v = return v
 end
 include Trivial_promises
 
@@ -1532,7 +1583,7 @@ include Trivial_promises
 module Pending_promises :
 sig
   (* Internal *)
-  val new_pending :
+  val new_pending : promise_type:Lwt_tracing.promise_type ->
     how_to_cancel:how_to_cancel -> ('a, underlying, pending) promise
   val propagate_cancel_to_several : _ t list -> how_to_cancel
 
@@ -1542,14 +1593,14 @@ sig
 
   val waiter_of_wakener : 'a u -> 'a t
 
-  val add_task_r : 'a u Lwt_sequence.t -> 'a t
-  val add_task_l : 'a u Lwt_sequence.t -> 'a t
+  val add_task_r : ?promise_type:Lwt_tracing.promise_type -> 'a u Lwt_sequence.t -> 'a t
+  val add_task_l : ?promise_type:Lwt_tracing.promise_type -> 'a u Lwt_sequence.t -> 'a t
 
   val protected : 'a t -> 'a t
   val no_cancel : 'a t -> 'a t
 end =
 struct
-  let new_pending ~how_to_cancel =
+  let new_pending ~promise_type ~how_to_cancel =
     let state =
       Pending {
         regular_callbacks = Regular_callback_list_empty;
@@ -1558,7 +1609,11 @@ struct
         cleanups_deferred = 0;
       }
     in
-    {state}
+    let uid = Lwt_tracing.create_promise promise_type in
+    let p = {state; uid} in
+    Gc.finalise_last (fun () -> Lwt_tracing.promise_collected uid) p;
+    p
+
 
   let propagate_cancel_to_several ps =
     (* Using a dirty cast here to avoid rebuilding the list :( Not bothering
@@ -1571,11 +1626,11 @@ struct
 
 
   let wait () =
-    let p = new_pending ~how_to_cancel:Not_cancelable in
+    let p = new_pending ~promise_type:`Wait ~how_to_cancel:Not_cancelable in
     to_public_promise p, to_public_resolver p
 
   let task () =
-    let p = new_pending ~how_to_cancel:Cancel_this_promise in
+    let p = new_pending ~promise_type:`Task ~how_to_cancel:Cancel_this_promise in
     to_public_promise p, to_public_resolver p
 
 
@@ -1593,25 +1648,29 @@ struct
         : ('a, 'u, 'c) promise Lwt_sequence.node =
     Obj.magic node
 
-  let add_task_r sequence =
-    let p = new_pending ~how_to_cancel:Cancel_this_promise in
+  let add_task_r ?(promise_type=`Sequence) sequence =
+    let p = new_pending ~promise_type ~how_to_cancel:Cancel_this_promise in
     let node = Lwt_sequence.add_r (to_public_resolver p) sequence in
     let node = cast_sequence_node node p in
 
     let Pending callbacks = p.state in
-    callbacks.cancel_callbacks <-
-      Cancel_callback_list_remove_sequence_node node;
+    let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Add_task_r ()) in
+    let callback = Cancel_callback_list_remove_sequence_node (cuid,node) in
+    if_callback_collected cuid callback;
+    callbacks.cancel_callbacks <- callback;
 
     to_public_promise p
 
-  let add_task_l sequence =
-    let p = new_pending ~how_to_cancel:Cancel_this_promise in
+  let add_task_l ?(promise_type=`Sequence) sequence =
+    let p = new_pending ~promise_type ~how_to_cancel:Cancel_this_promise in
     let node = Lwt_sequence.add_l (to_public_resolver p) sequence in
     let node = cast_sequence_node node p in
 
     let Pending callbacks = p.state in
-    callbacks.cancel_callbacks <-
-      Cancel_callback_list_remove_sequence_node node;
+    let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Add_task_l ()) in
+    let callback = Cancel_callback_list_remove_sequence_node (cuid, node) in
+    if_callback_collected cuid callback;
+    callbacks.cancel_callbacks <- callback;
 
     to_public_promise p
 
@@ -1624,7 +1683,7 @@ struct
     | Rejected _ -> p
 
     | Pending _ ->
-      let p' = new_pending ~how_to_cancel:Cancel_this_promise in
+      let p' = new_pending ~promise_type:`Protected ~how_to_cancel:Cancel_this_promise in
 
       let callback p_result =
         let State_may_now_be_pending_proxy p' = may_now_be_proxy p' in
@@ -1649,12 +1708,16 @@ struct
       in
 
       let remove_the_callback =
+        let cuid = Lwt_tracing.(attach_callback (uid_of_promise p) Protected ()) in
+        if_callback_collected cuid callback;
         add_explicitly_removable_callback_and_give_remove_function
-          [p] callback
+          [p] (cuid,callback)
       in
 
       let Pending p'_callbacks = p'.state in
-      add_cancel_callback p'_callbacks remove_the_callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p') Cancel ()) in
+      if_callback_collected cuid remove_the_callback;
+      add_cancel_callback p'_callbacks (cuid, remove_the_callback);
 
       to_public_promise p'
 
@@ -1665,7 +1728,7 @@ struct
     | Rejected _ -> p
 
     | Pending p_callbacks ->
-      let p' = new_pending ~how_to_cancel:Not_cancelable in
+      let p' = new_pending ~promise_type:`No_cancel ~how_to_cancel:Not_cancelable in
 
       let callback p_result =
         let State_may_now_be_pending_proxy p' = may_now_be_proxy p' in
@@ -1679,7 +1742,9 @@ struct
           resolve ~allow_deferring:false p' p_result in
         ignore p'
       in
-      add_implicitly_removed_callback p_callbacks callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_promise p) No_cancel ()) in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid,callback);
 
       to_public_promise p'
 end
@@ -1782,7 +1847,8 @@ struct
     (* Using [p'] as it's the name used inside [bind], etc., for promises with
        this role -- [p'] is the promise returned by the user's function. *)
     let p' = underlying user_provided_promise in
-
+    Lwt_tracing.(proxy ~proxy:(uid_of_internal_promise user_provided_promise)
+                   (uid_of_internal_promise outer_promise));
     if identical p' outer_promise then
       State_may_have_changed p'
       (* We really want to return [State_may_have_changed outer_promise], but
@@ -1843,7 +1909,7 @@ struct
 
       Functions other than [Lwt.bind] have analogous deferral behavior. *)
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Bind ~how_to_cancel:(Propagate_cancel_to_one p) in
       (* The result promise is a fresh pending promise.
 
          Initially, trying to cancel this fresh pending promise [p''] will
@@ -1896,18 +1962,28 @@ struct
     | Fulfilled v ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> f v)
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Bind (FPFulfilled (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
+            f v)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          (p'', callback, p.state))
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Bind (FPFulfilled (`Deferred, f))) in
+          if_callback_collected cuid callback;
+          (p'', (cuid,callback), p.state))
 
     | Rejected _ as result ->
-      to_public_promise {state = result}
+      let uid = Lwt_tracing.create_promise `Fail in
+      let p = to_public_promise {state = result; uid} in
+      Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
+      p
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      add_implicitly_removed_callback p_callbacks callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Bind (FPPending f)) in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid,callback);
       p''
 
   let backtrace_bind add_loc p f =
@@ -1915,7 +1991,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Backtrace_bind ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -1950,18 +2026,28 @@ struct
     | Fulfilled v ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> f v)
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Backtrace_bind (FPFulfilled (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
+            f v)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          (p'', callback, p.state))
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Backtrace_bind (FPFulfilled (`Deferred, f))) in
+          if_callback_collected cuid callback;
+          (p'', (cuid,callback), p.state))
 
     | Rejected exn ->
-      to_public_promise {state = Rejected (add_loc exn)}
+      let uid = Lwt_tracing.create_promise `Fail in
+      let p = to_public_promise {state = Rejected (add_loc exn); uid} in
+      Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
+      p
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      add_implicitly_removed_callback p_callbacks callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Backtrace_bind (FPPending f)) in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid,callback);
       p''
 
   let map f p =
@@ -1969,7 +2055,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Map ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2004,20 +2090,33 @@ struct
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
-          to_public_promise
-            {state = try Fulfilled (f v) with exn -> Rejected exn})
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Map (FPFulfilled (`Eager, f))) in
+            let uid = Lwt_tracing.create_promise `Fail in
+            let f = Lwt_tracing.resolve cuid f in
+            let p = to_public_promise
+                {state = (try Fulfilled (f v) with exn -> Rejected exn); uid} in
+            Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
+            p)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          (p'', callback, p.state))
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Map (FPFulfilled (`Deferred, f))) in
+          if_callback_collected cuid callback;
+          (p'', (cuid,callback), p.state))
 
     | Rejected _ as result ->
-      to_public_promise {state = result}
+      let uid = Lwt_tracing.create_promise `Fail in
+      let p = to_public_promise {state = result; uid} in
+      Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
+      p
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      add_implicitly_removed_callback p_callbacks callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Map (FPPending f)) in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid,callback);
       p''
+
 
   let catch f h =
     let p = try f () with exn -> fail exn in
@@ -2025,7 +2124,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Catch ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2063,15 +2162,22 @@ struct
     | Rejected exn ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> h exn)
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Catch (RPRejected (`Eager, h))) in
+            let h = Lwt_tracing.resolve cuid h in
+            h exn)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          (p'', callback, p.state))
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Catch (RPRejected (`Deferred, h))) in
+          if_callback_collected cuid callback;
+          (p'', (cuid,callback), p.state))
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      add_implicitly_removed_callback p_callbacks callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Catch (RPPending f)) in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid,callback);
       p''
 
   let backtrace_catch add_loc f h =
@@ -2080,7 +2186,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Backtrace_catch ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2118,15 +2224,22 @@ struct
     | Rejected exn ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> h (add_loc exn))
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Backtrace_catch (RPRejected (`Eager, h))) in
+            let h = Lwt_tracing.resolve cuid h in
+            h exn)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          (p'', callback, p.state))
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Backtrace_catch (RPRejected (`Deferred, h))) in
+          if_callback_collected cuid callback;
+          (p'', (cuid,callback), p.state))
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      add_implicitly_removed_callback p_callbacks callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Backtrace_catch (RPPending f)) in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid,callback);
       p''
 
   let try_bind f f' h =
@@ -2135,7 +2248,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Try_bind ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2175,24 +2288,36 @@ struct
     | Fulfilled v ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> f' v)
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Try_bind (FRPFulfilled (`Eager, f'))) in
+            let f' = Lwt_tracing.resolve cuid f' in
+            f' v)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          (p'', callback, p.state))
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Try_bind (FRPFulfilled (`Deferred, f'))) in
+          if_callback_collected cuid callback;
+          (p'', (cuid,callback), p.state))
 
     | Rejected exn ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> h exn)
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Try_bind (FRPRejected (`Eager, h))) in
+            let h = Lwt_tracing.resolve cuid h in
+            h exn)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          (p'', callback, p.state))
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Try_bind (FRPRejected (`Deferred, h))) in
+          if_callback_collected cuid callback;
+          (p'', (cuid, callback), p.state))
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      add_implicitly_removed_callback p_callbacks callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Try_bind (FRPPending (f', h))) in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid, callback);
       p''
 
   let backtrace_try_bind add_loc f f' h =
@@ -2201,7 +2326,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~promise_type:`Backtrace_try_bind ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2241,24 +2366,36 @@ struct
     | Fulfilled v ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> f' v)
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Backtrace_try_bind (FRPFulfilled (`Eager, f'))) in
+            let f' = Lwt_tracing.resolve cuid f' in
+            f' v)
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          (p'', callback, p.state))
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Backtrace_try_bind (FRPFulfilled (`Deferred, f'))) in
+          if_callback_collected cuid callback;
+          (p'', (cuid, callback), p.state))
 
     | Rejected exn ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> h (add_loc exn))
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Backtrace_try_bind (FRPRejected (`Eager, h))) in
+            let h = Lwt_tracing.resolve cuid h in
+            h (add_loc exn))
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
-          (p'', callback, p.state))
+          let cuid = Lwt_tracing.(attach_callback (uid_of_promise p'') Backtrace_try_bind (FRPRejected (`Deferred, h))) in
+          if_callback_collected cuid callback;
+          (p'', (cuid, callback), p.state))
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
-      add_implicitly_removed_callback p_callbacks callback;
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Backtrace_try_bind (FRPPending (f', h))) in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid, callback);
       p''
 
   let finalize f f' =
@@ -2281,9 +2418,13 @@ struct
     | Rejected Canceled ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> handle_with_async_exception_hook f ())
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_cancel (RPRejected (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
+            handle_with_async_exception_hook (cuid, f) ())
         ~if_deferred:(fun () ->
-          ((), (fun _ -> handle_with_async_exception_hook f ()), Fulfilled ()))
+          let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_cancel (RPRejected (`Deferred, f))) in
+          ((), (cuid, (fun _ -> handle_with_async_exception_hook (cuid,f) ())), Fulfilled ()))
 
     | Rejected _ ->
       ()
@@ -2292,7 +2433,8 @@ struct
       ()
 
     | Pending callbacks ->
-      add_cancel_callback callbacks f
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_cancel (RPPending f)) in
+      add_cancel_callback callbacks (cuid, f)
 
 
 
@@ -2300,40 +2442,47 @@ struct
     let Internal p = to_internal_promise p in
     let p = underlying p in
 
-    let callback_if_deferred () =
+    let callback_if_deferred cuid =
       let saved_storage = !current_storage in
 
-      fun result ->
+      (fun result ->
         match result with
         | Fulfilled v ->
           current_storage := saved_storage;
-          handle_with_async_exception_hook f v
+          handle_with_async_exception_hook (cuid,f) v
 
         | Rejected _ ->
-          ()
+          ())
     in
 
     match p.state with
     | Fulfilled v ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> handle_with_async_exception_hook f v)
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_success (FPFulfilled (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
+            handle_with_async_exception_hook (cuid,f) v)
         ~if_deferred:(fun () ->
-          let callback = callback_if_deferred () in
-          ((), callback, p.state))
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_success (FPFulfilled (`Deferred, f))) in
+            let callback = callback_if_deferred cuid in
+            if_callback_collected cuid callback;
+          ((), (cuid, callback), p.state))
 
     | Rejected _ ->
       ()
 
     | Pending p_callbacks ->
-      let callback = callback_if_deferred () in
-      add_implicitly_removed_callback p_callbacks callback
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_success (FPPending f)) in
+      let callback = callback_if_deferred cuid in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid, callback)
 
   let on_failure p f =
     let Internal p = to_internal_promise p in
     let p = underlying p in
 
-    let callback_if_deferred () =
+    let callback_if_deferred cuid =
       let saved_storage = !current_storage in
 
       fun result ->
@@ -2343,7 +2492,7 @@ struct
 
         | Rejected exn ->
           current_storage := saved_storage;
-          handle_with_async_exception_hook f exn
+          handle_with_async_exception_hook (cuid,f) exn
     in
 
     match p.state with
@@ -2353,86 +2502,117 @@ struct
     | Rejected exn ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> handle_with_async_exception_hook f exn)
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_failure (RPRejected (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
+            handle_with_async_exception_hook (cuid,f) exn)
         ~if_deferred:(fun () ->
-          let callback = callback_if_deferred () in
-          ((), callback, p.state))
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_failure (RPRejected (`Deferred, f))) in
+            let callback = callback_if_deferred cuid in
+            if_callback_collected cuid callback;
+          ((), (cuid, callback), p.state))
 
     | Pending p_callbacks ->
-      let callback = callback_if_deferred () in
-      add_implicitly_removed_callback p_callbacks callback
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_failure (RPPending f)) in
+      let callback = callback_if_deferred cuid in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid, callback)
 
   let on_termination p f =
     let Internal p = to_internal_promise p in
     let p = underlying p in
 
-    let callback_if_deferred () =
+    let callback_if_deferred cuid =
       let saved_storage = !current_storage in
 
       fun _result ->
         current_storage := saved_storage;
-        handle_with_async_exception_hook f ()
+        handle_with_async_exception_hook (cuid,f) ()
     in
 
     match p.state with
     | Fulfilled _ ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> handle_with_async_exception_hook f ())
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_termination (FRPFulfilled (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
+            handle_with_async_exception_hook (cuid, f) ())
         ~if_deferred:(fun () ->
-          let callback = callback_if_deferred () in
-          ((), callback, p.state))
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_termination (FRPFulfilled (`Deferred, f))) in
+            let callback = callback_if_deferred cuid in
+            if_callback_collected cuid callback;
+            ((), (cuid, callback), p.state))
 
     | Rejected _ ->
       run_callback_or_defer_it
       ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> handle_with_async_exception_hook f ())
-        ~if_deferred:(fun () ->
-          let callback = callback_if_deferred () in
-          ((), callback, p.state))
+      ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_termination (FRPRejected (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
+            handle_with_async_exception_hook (cuid, f) ())
+      ~if_deferred:(fun () ->
+          let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_termination (FRPRejected (`Deferred, f))) in
+          let callback = callback_if_deferred cuid in
+          if_callback_collected cuid callback;
+          ((), (cuid, callback), p.state))
 
     | Pending p_callbacks ->
-      let callback = callback_if_deferred () in
-      add_implicitly_removed_callback p_callbacks callback
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_termination (FRPPending (f,f))) in
+      let callback = callback_if_deferred cuid in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid, callback)
 
   let on_any p f g =
     let Internal p = to_internal_promise p in
     let p = underlying p in
 
-    let callback_if_deferred () =
+    let callback_if_deferred cuid =
       let saved_storage = !current_storage in
 
       fun result ->
         match result with
         | Fulfilled v ->
           current_storage := saved_storage;
-          handle_with_async_exception_hook f v
+          handle_with_async_exception_hook (cuid,f) v
 
         | Rejected exn ->
           current_storage := saved_storage;
-          handle_with_async_exception_hook g exn
+          handle_with_async_exception_hook (cuid,g) exn
     in
 
     match p.state with
     | Fulfilled v ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> handle_with_async_exception_hook f v)
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_any (FRPFulfilled (`Eager, f))) in
+            let f = Lwt_tracing.resolve cuid f in
+            handle_with_async_exception_hook (cuid,f) v)
         ~if_deferred:(fun () ->
-          let callback = callback_if_deferred () in
-          ((), callback, p.state))
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_any (FRPFulfilled (`Deferred, f))) in
+            let callback = callback_if_deferred cuid in
+            if_callback_collected cuid callback;
+          ((), (cuid, callback), p.state))
 
     | Rejected exn ->
       run_callback_or_defer_it
         ~run_immediately_and_ensure_tail_call:true
-        ~callback:(fun () -> handle_with_async_exception_hook g exn)
+        ~callback:(fun () ->
+            let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_any (FRPRejected (`Eager, g))) in
+            let g = Lwt_tracing.resolve cuid g in
+            handle_with_async_exception_hook (cuid, g) exn)
         ~if_deferred:(fun () ->
-          let callback = callback_if_deferred () in
-          ((), callback, p.state))
+          let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_any (FRPRejected (`Deferred, g))) in
+          let callback = callback_if_deferred cuid in
+          if_callback_collected cuid callback;
+          ((), (cuid, callback), p.state))
 
     | Pending p_callbacks ->
-      let callback = callback_if_deferred () in
-      add_implicitly_removed_callback p_callbacks callback
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) On_any (FRPPending (f,g))) in
+      let callback = callback_if_deferred cuid in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid, callback)
 end
 include Sequential_composition
 
@@ -2490,7 +2670,9 @@ struct
         | Rejected exn ->
           !async_exception_hook exn
       in
-      add_implicitly_removed_callback p_callbacks callback
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Async ()) in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid, callback)
 
   let ignore_result p =
     let Internal p = to_internal_promise p in
@@ -2509,12 +2691,14 @@ struct
         | Rejected exn ->
           !async_exception_hook exn
       in
-      add_implicitly_removed_callback p_callbacks callback
+      let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Ignore_result ()) in
+      if_callback_collected cuid callback;
+      add_implicitly_removed_callback p_callbacks (cuid, callback)
 
 
 
   let join ps =
-    let p' = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+    let p' = new_pending ~promise_type:`Join ~how_to_cancel:(propagate_cancel_to_several ps) in
 
     let number_pending_in_ps = ref 0 in
     let join_result = ref (Fulfilled ()) in
@@ -2548,11 +2732,22 @@ struct
     (* Attach the above callback. Simultaneously count how many pending promises
        there are in [ps] (initially). If that number is zero, the [join] must
        resolve immediately. *)
-    let rec attach_callback_or_resolve_immediately ps =
+    let rec attach_callback_or_resolve_immediately ~cty ps =
       match ps with
       | [] ->
-        if !number_pending_in_ps = 0 then
-          to_public_promise {state = !join_result}
+        if !number_pending_in_ps = 0 then (
+          let uid,p =
+            match !join_result with
+            | Fulfilled () ->
+              let uid = Lwt_tracing.create_promise `Return in
+              uid, to_public_promise {state = !join_result; uid}
+            | Rejected _ ->
+              let uid = Lwt_tracing.create_promise `Fail in
+              uid, to_public_promise {state = !join_result; uid}
+          in
+          Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
+          p
+        )
         else
           to_public_promise p'
 
@@ -2562,8 +2757,10 @@ struct
         match (underlying p).state with
         | Pending p_callbacks ->
           number_pending_in_ps := !number_pending_in_ps + 1;
-          add_implicitly_removed_callback p_callbacks callback;
-          attach_callback_or_resolve_immediately ps
+          let cuid = Lwt_tracing.(attach_callback (uid_of_internal_promise p) Join ()) in
+          if_callback_collected cuid callback;
+          add_implicitly_removed_callback p_callbacks (cuid, callback);
+          attach_callback_or_resolve_immediately ~cty ps
 
         | Rejected _ as p_result ->
           (* As in the callback above, but for already-resolved promises in
@@ -2574,13 +2771,13 @@ struct
           | Fulfilled () -> join_result := p_result;
           | Rejected _ -> ()
           end;
-          attach_callback_or_resolve_immediately ps
+          attach_callback_or_resolve_immediately ~cty ps
 
         | Fulfilled () ->
-          attach_callback_or_resolve_immediately ps
+          attach_callback_or_resolve_immediately ~cty ps
     in
 
-    attach_callback_or_resolve_immediately ps
+    attach_callback_or_resolve_immediately ~cty:Lwt_tracing.Join ps
 
   (* this is 3 words, smaller than the 2 times 2 words a pair of references
      would take. *)
@@ -2688,7 +2885,7 @@ struct
         "Lwt.choose [] would return a promise that is pending forever";
     match count_resolved_promises_in ps with
     | 0 ->
-      let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+      let p = new_pending ~promise_type:`Choose ~how_to_cancel:(propagate_cancel_to_several ps) in
 
       let callback result =
         let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2697,7 +2894,10 @@ struct
           resolve ~allow_deferring:false p result in
         ignore p
       in
-      add_explicitly_removable_callback_to_each_of ps callback;
+      let promise_uid_list = List.map uid_of_promise ps in
+      let cuid = Lwt_tracing.(attach_callback_list promise_uid_list Choose ()) in
+      if_callback_collected cuid callback;
+      add_explicitly_removable_callback_to_each_of ps (cuid, callback);
 
       to_public_promise p
 
@@ -2712,7 +2912,7 @@ struct
       invalid_arg "Lwt.pick [] would return a promise that is pending forever";
     match count_resolved_promises_in ps with
     | 0 ->
-      let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+      let p = new_pending ~promise_type:`Pick ~how_to_cancel:(propagate_cancel_to_several ps) in
 
       let callback result =
         let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2722,7 +2922,10 @@ struct
           resolve ~allow_deferring:false p result in
         ignore p
       in
-      add_explicitly_removable_callback_to_each_of ps callback;
+      let promise_uid_list = List.map uid_of_promise ps in
+      let cuid = Lwt_tracing.(attach_callback_list promise_uid_list Pick ()) in
+      if_callback_collected cuid callback;
+      add_explicitly_removable_callback_to_each_of ps (cuid, callback);
 
       to_public_promise p
 
@@ -2781,7 +2984,10 @@ struct
           collect_already_fulfilled_promises_or_find_rejected (v::acc) ps
 
         | Rejected _ as result ->
-          to_public_promise {state = result}
+          let uid = Lwt_tracing.create_promise `Fail in
+          let p = to_public_promise {state = result; uid} in
+          Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
+          p
 
         | Pending _ ->
           collect_already_fulfilled_promises_or_find_rejected acc ps
@@ -2793,7 +2999,7 @@ struct
     let rec check_for_already_resolved_promises ps' =
       match ps' with
       | [] ->
-        let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+        let p = new_pending ~promise_type:`Nchoose ~how_to_cancel:(propagate_cancel_to_several ps) in
 
         let callback _result =
           let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2803,7 +3009,10 @@ struct
             resolve ~allow_deferring:false p result in
           ignore p
         in
-        add_explicitly_removable_callback_to_each_of ps callback;
+        let promise_uid_list = List.map uid_of_promise ps in
+        let cuid = Lwt_tracing.(attach_callback_list promise_uid_list Nchoose ()) in
+        if_callback_collected cuid callback;
+        add_explicitly_removable_callback_to_each_of ps (cuid, callback);
 
         to_public_promise p
 
@@ -2814,7 +3023,10 @@ struct
           collect_already_fulfilled_promises_or_find_rejected [v] ps
 
         | Rejected _ as result ->
-          to_public_promise {state = result}
+          let uid = Lwt_tracing.create_promise `Fail in
+          let p = to_public_promise {state = result; uid} in
+          Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
+          p
 
         | Pending _ ->
           check_for_already_resolved_promises ps
@@ -2842,7 +3054,10 @@ struct
 
         | Rejected _ as result ->
           List.iter cancel ps;
-          to_public_promise {state = result}
+          let uid = Lwt_tracing.create_promise `Fail in
+          let p = to_public_promise {state = result; uid} in
+          Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
+          p
 
         | Pending _ ->
           collect_already_fulfilled_promises_or_find_rejected acc ps'
@@ -2851,7 +3066,7 @@ struct
     let rec check_for_already_resolved_promises ps' =
       match ps' with
       | [] ->
-        let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+        let p = new_pending ~promise_type:`Npick ~how_to_cancel:(propagate_cancel_to_several ps) in
 
         let callback _result =
           let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2862,7 +3077,10 @@ struct
             resolve ~allow_deferring:false p result in
           ignore p
         in
-        add_explicitly_removable_callback_to_each_of ps callback;
+        let promise_uid_list = List.map uid_of_promise ps in
+        let cuid = Lwt_tracing.(attach_callback_list promise_uid_list Npick ()) in
+        if_callback_collected cuid callback;
+        add_explicitly_removable_callback_to_each_of ps (cuid, callback);
 
         to_public_promise p
 
@@ -2874,7 +3092,11 @@ struct
 
         | Rejected _ as result ->
           List.iter cancel ps;
-          to_public_promise {state = result}
+          let uid = Lwt_tracing.create_promise `Fail in
+          let p = to_public_promise {state = result; uid} in
+          Lwt_tracing.(!tracer.create_promise uid `Fail);
+          Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
+          p
 
         | Pending _ ->
           check_for_already_resolved_promises ps'
@@ -2929,8 +3151,10 @@ struct
           collect_already_resolved_promises (v::results) pending ps
 
         | Rejected _ as result ->
-          to_public_promise {state = result}
-
+          let uid = Lwt_tracing.create_promise `Fail in
+          let p = to_public_promise {state = result ; uid} in
+          Gc.finalise_last (fun () -> Lwt_tracing.promise_collected uid) p;
+          p
         | Pending _ ->
           collect_already_resolved_promises results (p::pending) ps
     in
@@ -2938,7 +3162,7 @@ struct
     let rec check_for_already_resolved_promises pending_acc ps' =
       match ps' with
       | [] ->
-        let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+        let p = new_pending ~promise_type:`Nchoose_split ~how_to_cancel:(propagate_cancel_to_several ps) in
 
         let callback _result =
           let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2946,7 +3170,10 @@ struct
           let State_may_have_changed p = finish p [] [] ps in
           ignore p
         in
-        add_explicitly_removable_callback_to_each_of ps callback;
+        let promise_uid_list = List.map uid_of_promise ps in
+        let cuid = Lwt_tracing.(attach_callback_list promise_uid_list Nchoose_split ()) in
+        if_callback_collected cuid callback;
+        add_explicitly_removable_callback_to_each_of ps (cuid, callback);
 
         to_public_promise p
 
@@ -2957,7 +3184,10 @@ struct
           collect_already_resolved_promises [v] pending_acc ps'
 
         | Rejected _ as result ->
-          to_public_promise {state = result}
+          let uid = Lwt_tracing.create_promise `Fail in
+          let p = to_public_promise {state = result; uid} in
+          Gc.finalise_last (fun () -> Lwt_tracing.(promise_collected uid)) p;
+          p
 
         | Pending _ ->
           check_for_already_resolved_promises (p::pending_acc) ps'
@@ -3094,7 +3324,7 @@ struct
   let paused_count = ref 0
 
   let pause () =
-    let p = add_task_r paused in
+    let p = add_task_r ~promise_type:`Pause paused in
     incr paused_count;
     !pause_hook !paused_count;
     p
@@ -3163,3 +3393,10 @@ struct
   let make_error exn = Result.Error exn
 end
 include Lwt_result_type
+
+
+(* Because of profiling which introduces optional parameter *)
+
+let add_task_r node = add_task_r node
+
+let add_task_l node = add_task_l node
