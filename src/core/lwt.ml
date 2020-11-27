@@ -907,13 +907,14 @@ struct
      to clean the callback list (right after clearing a cell). When the counter
      reaches [cleanup_throttle], the callback list is actually scanned and
      cleared callback cells are removed. *)
-  let clear_explicitly_removable_callback_cell cell ~originally_added_to:ps =
+  let clear_explicitly_removable_callback_cell cuid cell ~originally_added_to:ps =
     cell := None;
 
     (* Go through the promises the cell had originally been added to, and either
        defer a cleanup, or actually clean up their callback lists. *)
     ps |> List.iter (fun p ->
-      let Internal p = to_internal_promise p in
+        let Internal p = to_internal_promise p in
+        Lwt_tracing.(detach_callback (uid_of_internal_promise p) cuid);
       match (underlying p).state with
       (* Some of the promises may already have been resolved at the time this
          function is called. *)
@@ -925,8 +926,7 @@ struct
         (* If the promise has only one regular callback, and it is removable, it
            must have been the cell cleared in this function, above. In that
            case, just set its callback list to empty. *)
-        | Regular_callback_list_explicitly_removable_callback {contents = Some (cuid,_)} ->
-          Lwt_tracing.(detach_callback (uid_of_internal_promise p) cuid);
+        | Regular_callback_list_explicitly_removable_callback {contents = Some (_,_)} ->
           callbacks.regular_callbacks <- Regular_callback_list_empty
         | Regular_callback_list_explicitly_removable_callback {contents = None} ->
           callbacks.regular_callbacks <- Regular_callback_list_empty
@@ -939,6 +939,7 @@ struct
         | Regular_callback_list_concat _ ->
           let cleanups_deferred = callbacks.cleanups_deferred + 1 in
           if cleanups_deferred > cleanup_throttle then begin
+            (* only this callback can be cleaned up *)
             callbacks.cleanups_deferred <- 0;
             callbacks.regular_callbacks <-
               clean_up_callback_cells callbacks.regular_callbacks
@@ -1001,7 +1002,7 @@ struct
   let add_explicitly_removable_callback_and_give_cell ps (id,f) =
     let rec cell = ref (Some (id, self_removing_callback_wrapper))
     and self_removing_callback_wrapper result =
-      clear_explicitly_removable_callback_cell cell ~originally_added_to:ps;
+      clear_explicitly_removable_callback_cell id cell ~originally_added_to:ps;
       f result
     in
 
@@ -1020,10 +1021,10 @@ struct
 
   (* This is basically just to support [Lwt.protected], which needs to remove
      the callback in circumstances other than the callback being called. *)
-  let add_explicitly_removable_callback_and_give_remove_function ps f =
-    let cell = add_explicitly_removable_callback_and_give_cell ps f in
+  let add_explicitly_removable_callback_and_give_remove_function ps (id,f) =
+    let cell = add_explicitly_removable_callback_and_give_cell ps (id,f) in
     fun () ->
-      clear_explicitly_removable_callback_cell cell ~originally_added_to:ps
+      clear_explicitly_removable_callback_cell id cell ~originally_added_to:ps
 
   let add_cancel_callback callbacks f =
     (* Ugly cast :( *)
