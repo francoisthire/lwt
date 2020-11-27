@@ -162,7 +162,7 @@ let pp_counter : Format.formatter -> (module C) -> unit = fun fmt (module C) ->
 
 let create_promise_counter = make_counter "create_promise"
 
-let attack_callback_counter = make_counter "attack_callback_counter"
+let attach_callback_counter = make_counter "attach_callback_counter"
 
 let wakeup_counter = make_counter "wakeup_counter"
 
@@ -182,7 +182,7 @@ let counter_tracer =
   {
     create_promise = (fun _ _ -> incr create_promise_counter);
 
-    attach_callback = (fun _ _ _ _ -> incr attack_callback_counter);
+    attach_callback = (fun _ _ _ _ -> incr attach_callback_counter);
 
     wakeup  = (fun _ _ -> incr wakeup_counter);
 
@@ -206,7 +206,7 @@ let _ =
 
 let pp_trace_counter () =
   Format.eprintf "%a@." pp_counter create_promise_counter;
-  Format.eprintf "%a@." pp_counter attack_callback_counter;
+  Format.eprintf "%a@." pp_counter attach_callback_counter;
   Format.eprintf "%a@." pp_counter wakeup_counter;
   Format.eprintf "%a@." pp_counter cancel_counter;
   Format.eprintf "%a@." pp_counter resolve_counter;
